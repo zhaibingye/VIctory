@@ -1518,4 +1518,63 @@ mod tests {
         let mut srv_fmt = DXGI_FORMAT(B5G5R5A1_UNORM as i32);
         assert!(super::fits(&tex, &[B5G5R5A1_UNORM], Some(&mut srv_fmt), false));
     }
+
+    #[test]
+    fn supported_typed_uav_formats_are_accepted() {
+        let Some(host) = host() else {
+            return;
+        };
+        let make_tex = |format: DXGI_FORMAT| {
+            let mut tex: Option<ID3D12Resource> = None;
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 4,
+                Height: 4,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: format,
+                SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                ..Default::default()
+            };
+            // SAFETY: plain committed texture on the default heap.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(
+                        &D3D12_HEAP_PROPERTIES {
+                            Type: D3D12_HEAP_TYPE_DEFAULT,
+                            ..Default::default()
+                        },
+                        D3D12_HEAP_FLAG_NONE,
+                        &desc,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        None,
+                        &mut tex,
+                    )
+                    .unwrap();
+            }
+            tex.unwrap()
+        };
+
+        let typeless = make_tex(DXGI_FORMAT_R8G8B8A8_TYPELESS);
+        assert!(!super::fits(&typeless, &[], None, true));
+        for format in [DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UINT] {
+            let mut fmt = format;
+            assert!(super::fits(&typeless, &[], Some(&mut fmt), true));
+            assert_eq!(fmt, format);
+        }
+        let mut srgb = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+        assert!(super::fits(&typeless, &[], Some(&mut srgb), true));
+        assert_eq!(srgb, DXGI_FORMAT_R8G8B8A8_UNORM);
+
+        for format in [DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R16G16B16A16_FLOAT] {
+            let typed = make_tex(format);
+            assert!(super::fits(&typed, &[], None, true));
+            let mut fmt = format;
+            assert!(super::fits(&typed, &[], Some(&mut fmt), true));
+        }
+    }
 }
