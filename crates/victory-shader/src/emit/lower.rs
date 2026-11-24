@@ -156,8 +156,7 @@ fn buffer_format(format: u8) -> Option<(&'static [u32], Numeric)> {
 /// How far a float channel of `width` bits (16, or the unsigned 11- and
 /// 10-bit floats of the packed formats) shifts up to be a half:
 /// the small floats are a half's exponent (5 bits, biased 15) and the top
-/// of its mantissa, without the sign, so `legacyF16ToF32` widens them
-/// exactly, denormals, infinities and NaNs included.
+/// of its mantissa, without the sign.
 fn half_shift(width: u32) -> u32 {
     debug_assert!(matches!(width, 10 | 11 | 16), "{width}-bit float");
     if width == 16 { 0 } else { 15 - width }
@@ -4525,10 +4524,23 @@ impl<'a> Lower<'a> {
                             self.s.m.bin(c, Bin::Shl, field, sh)
                         }
                     };
+                    // GFX10 typed loads preserve even a signaling NaN's payload. For
+                    // exponent 31, widen with exponent 15 so the host sees a finite
+                    // value, then restore the high exponent bit in the f32 result.
+                    let exp_mask = self.s.m.i32(0x7c00);
+                    let exp = self.s.m.bin(c, Bin::And, h, exp_mask);
+                    let special = self.s.m.cmp(c, pred::EQ, exp, exp_mask);
+                    let high_bit = self.s.m.i32(0x4000);
+                    let zero = self.s.m.i32(0);
+                    let restore = self.s.m.select(c, special, high_bit, zero);
+                    let finite = self.s.m.bin(c, Bin::Xor, h, restore);
                     let f = self
                         .s
-                        .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[h]);
-                    float(self, f)
+                        .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[finite]);
+                    let bits = float(self, f);
+                    let shift = self.s.m.i32(16);
+                    let restore = self.s.m.bin(c, Bin::Shl, restore, shift);
+                    self.s.m.bin(c, Bin::Or, bits, restore)
                 }
             };
             out.push(x);

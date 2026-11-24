@@ -224,6 +224,46 @@ fn is_f16_nan(bits: u16) -> bool {
     (bits & 0x7FFF) > 0x7C00
 }
 
+#[test]
+fn typed_float_loads_preserve_nan_bits() {
+    // The low channel is a signed half, an unsigned 11-bit float, or an
+    // unsigned 10-bit float. Compare the returned VGPR bits, including the
+    // quiet bit that a floating-point is_nan check would miss.
+    for (format, cases) in [
+        (
+            13u32,
+            &[
+                (0x7c01, 0x7f80_2000),
+                (0xfc01, 0xff80_2000),
+                (0xfe55, 0xffca_a000),
+                (0xfc00, 0xff80_0000),
+                (0x8000, 0x8000_0000),
+            ][..],
+        ),
+        (
+            36,
+            &[(0x7c1, 0x7f82_0000), (0x7e1, 0x7fc2_0000), (1, 0x3580_0000)][..],
+        ),
+        (
+            43,
+            &[(0x3e1, 0x7f84_0000), (0x3f1, 0x7fc4_0000), (1, 0x3600_0000)][..],
+        ),
+    ] {
+        let mut body = buffer_store_dword(1, 8, 0).to_vec();
+        // tbuffer_load_format_x v0, off, s[8:11], 0 format:N
+        body.extend([0xe800_0000 | format << 19, 0x8002_0000]);
+        let shader = build_valu_cs(&body);
+        let inputs: Vec<_> = cases.iter().map(|&(raw, _)| [raw, 0, 0, 0]).collect();
+        run_cases(&shader, &inputs, |host, i, input, got| {
+            assert_eq!(
+                got, cases[i].1,
+                "{host}: format {format}, input {:#x}",
+                input[0]
+            );
+        });
+    }
+}
+
 fn f16_to_f32(bits: u16) -> f32 {
     let sign = u32::from(bits >> 15) << 31;
     let exp = (bits >> 10) & 0x1F;
