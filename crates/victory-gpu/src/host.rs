@@ -186,7 +186,7 @@ fn create() -> windows::core::Result<Host> {
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
         } else {
-            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            device = Some(create_hardware_device()?);
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
         let messages = debug
@@ -220,6 +220,18 @@ fn create() -> windows::core::Result<Host> {
             })?;
         let cpu_view_size =
             device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        if let Ok(desc) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+            .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter1>(device.GetAdapterLuid()))
+            .and_then(|adapter| adapter.GetDesc1())
+        {
+            tracing::info!(
+                adapter = %adapter_name(&desc),
+                vendor = format_args!("{:#06x}", desc.VendorId),
+                device = format_args!("{:#06x}", desc.DeviceId),
+                vram_mib = desc.DedicatedVideoMemory >> 20,
+                "host D3D12 adapter"
+            );
+        }
         tracing::info!("host D3D12 device ready");
         // The console fuses its multiply-adds (`v_fma_f32`, `v_fmac_f32`,
         // `v_fma_mix*`); the lowering's DXIL `FMad` is fused only where the
@@ -278,9 +290,122 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
     }
 }
 
+fn adapter_name(desc: &DXGI_ADAPTER_DESC1) -> String {
+    let len = desc
+        .Description
+        .iter()
+        .position(|&c| c == 0)
+        .unwrap_or(desc.Description.len());
+    String::from_utf16_lossy(&desc.Description[..len])
+}
+
+fn is_software_adapter(desc: &DXGI_ADAPTER_DESC1) -> bool {
+    desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0
+        || (desc.VendorId == 0x1414 && desc.DeviceId == 0x8c)
+}
+
+/// Resolves `VICTORY_D3D12_ADAPTER` against DXGI adapter names: a 0-based
+/// index or a case-insensitive substring of the adapter description.
+fn match_adapter(spec: &str, names: &[String]) -> Option<usize> {
+    let spec = spec.trim();
+    if spec.is_empty() {
+        return None;
+    }
+    if let Ok(index) = spec.parse::<usize>() {
+        return (index < names.len()).then_some(index);
+    }
+    let needle = spec.to_ascii_lowercase();
+    names
+        .iter()
+        .position(|name| name.to_ascii_lowercase().contains(&needle))
+}
+
+/// Picks the host hardware D3D12 device: `VICTORY_D3D12_ADAPTER` (0-based DXGI
+/// index or case-insensitive name substring) when set, else the first hardware
+/// adapter returned by `DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE`, falling back to
+/// DXGI's default adapter (`None`).
+fn create_hardware_device() -> windows::core::Result<ID3D12Device> {
+    let spec = std::env::var("VICTORY_D3D12_ADAPTER")
+        .ok()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty());
+    // SAFETY: plain DXGI adapter enumeration and D3D12CreateDevice calls.
+    unsafe {
+        if let Some(spec) = spec {
+            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+            let mut adapters = Vec::new();
+            let mut names = Vec::new();
+            for i in 0.. {
+                let Ok(adapter) = factory.EnumAdapters1(i) else {
+                    break;
+                };
+                let name = adapter
+                    .GetDesc1()
+                    .map(|d| adapter_name(&d))
+                    .unwrap_or_default();
+                adapters.push(adapter);
+                names.push(name);
+            }
+            let Some(chosen) = match_adapter(&spec, &names) else {
+                tracing::warn!(
+                    spec,
+                    available = ?names,
+                    "VICTORY_D3D12_ADAPTER matched no DXGI adapter"
+                );
+                return Err(windows::core::Error::from_hresult(DXGI_ERROR_NOT_FOUND));
+            };
+            let mut device: Option<ID3D12Device> = None;
+            D3D12CreateDevice(&adapters[chosen], D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            return device.ok_or_else(windows::core::Error::empty);
+        }
+        if let Ok(factory6) = CreateDXGIFactory2::<IDXGIFactory6>(DXGI_CREATE_FACTORY_FLAGS(0)) {
+            for i in 0.. {
+                let Ok(adapter) = factory6.EnumAdapterByGpuPreference::<IDXGIAdapter1>(
+                    i,
+                    DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+                ) else {
+                    break;
+                };
+                if adapter
+                    .GetDesc1()
+                    .is_ok_and(|desc| is_software_adapter(&desc))
+                {
+                    continue;
+                }
+                let mut device: Option<ID3D12Device> = None;
+                if D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).is_ok()
+                    && let Some(device) = device
+                {
+                    return Ok(device);
+                }
+            }
+        }
+        let mut device: Option<ID3D12Device> = None;
+        D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+        device.ok_or_else(windows::core::Error::empty)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn adapter_selector_matches_index_or_substring() {
+        let names = vec![
+            "Intel(R) UHD Graphics".to_owned(),
+            "NVIDIA GeForce RTX 3050 6GB Laptop GPU".to_owned(),
+            "Microsoft Basic Render Driver".to_owned(),
+        ];
+        assert_eq!(super::match_adapter("0", &names), Some(0));
+        assert_eq!(super::match_adapter(" 1 ", &names), Some(1));
+        assert_eq!(super::match_adapter("3", &names), None);
+        assert_eq!(super::match_adapter("nvidia", &names), Some(1));
+        assert_eq!(super::match_adapter("RTX 3050", &names), Some(1));
+        assert_eq!(super::match_adapter("uhd", &names), Some(0));
+        assert_eq!(super::match_adapter("radeon", &names), None);
+        assert_eq!(super::match_adapter("   ", &names), None);
+    }
 
     #[test]
     fn warp_adapter_accepts_only_software() {
