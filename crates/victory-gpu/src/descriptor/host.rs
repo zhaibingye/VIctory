@@ -971,15 +971,16 @@ fn fits(texture: &ID3D12Resource, castable: &[u32], mut format: Option<&mut DXGI
     }
     let view = format.as_ref().map_or(0, |f| f.0 as u32);
     if view == 0 {
-        return !typeless;
+        return !typeless && (!unordered || typed_store(own));
     }
     let cast = castable.contains(&view);
     if family(view) != family(own) && !cast {
         once!(view, own, "view format of another family");
         return false;
     }
-    if cast && family(view) != family(own) && unordered && !typed_store(view) {
-        once!(view, own, "an unordered view in a format the host cannot store");
+    let target = if !typeless && !cast { own } else { view };
+    if unordered && !typed_store(target) {
+        once!(target, own, "an unordered view in a format the host cannot store");
         return false;
     }
     if let Some(format) = format
@@ -1467,5 +1468,54 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    #[test]
+    fn unsupported_typed_uav_format_is_refused() {
+        let Some(host) = host() else {
+            return;
+        };
+        let mut tex: Option<ID3D12Resource> = None;
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 4,
+            Height: 4,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R16_TYPELESS,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        // SAFETY: plain committed typeless texture on the default heap.
+        unsafe {
+            host.device
+                .CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES {
+                        Type: D3D12_HEAP_TYPE_DEFAULT,
+                        ..Default::default()
+                    },
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    None,
+                    &mut tex,
+                )
+                .unwrap();
+        }
+        let tex = tex.unwrap();
+        const B5G5R5A1_UNORM: u32 = 86;
+        let mut fmt = DXGI_FORMAT(B5G5R5A1_UNORM as i32);
+        // Unsupported typed UAV format must be refused even when castable.
+        assert_eq!(
+            super::fits(&tex, &[B5G5R5A1_UNORM], Some(&mut fmt), true),
+            super::typed_store(B5G5R5A1_UNORM)
+        );
+        // SRV with the same castable format remains allowed.
+        let mut srv_fmt = DXGI_FORMAT(B5G5R5A1_UNORM as i32);
+        assert!(super::fits(&tex, &[B5G5R5A1_UNORM], Some(&mut srv_fmt), false));
     }
 }
