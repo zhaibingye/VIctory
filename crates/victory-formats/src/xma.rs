@@ -1153,10 +1153,35 @@ mod tests {
         assert_eq!(c.next, None);
     }
 
+    /// Frames declared by the stream starting in the first packet.
+    fn stream_frame_count(data: &[u8]) -> u32 {
+        let mut frames = 0;
+        let mut index = 0;
+        while index < data.len() / PACKET_BYTES {
+            let header = packet(data, index).unwrap();
+            frames += header.frames;
+            index += 1 + header.skip as usize;
+        }
+        frames
+    }
+
+    #[test]
+    fn counts_only_packets_in_the_selected_stream() {
+        // One stream occupies packets 0, 2 and 3. The other occupies 1 and 4.
+        let mut data = vec![0; 5 * PACKET_BYTES];
+        let headers = [(1, 1), (2, 2), (2, 0), (1, 1), (3, 0)];
+        for (i, (frames, skip)) in headers.into_iter().enumerate() {
+            put_bits(&mut data, i * PACKET_BITS, 6, frames);
+            put_bits(&mut data, i * PACKET_BITS + 24, 8, skip);
+        }
+        assert_eq!(stream_frame_count(&data), 4);
+        assert_eq!(stream_frame_count(&data[PACKET_BYTES..]), 5);
+    }
+
     /// Walks and decodes saved input buffers (`VICTORY_XMA_STREAMS=<dir>` of
     /// `*.xma` files with their `*.ctx` context words, made outside the
     /// repository): the frames walked from the first packet must be the
-    /// frames the packet headers count, and every frame must decode.
+    /// frames that stream's packet headers count, and every frame must decode.
     #[test]
     #[ignore = "needs streams outside the repository"]
     fn walks_saved_streams() {
@@ -1170,9 +1195,7 @@ mod tests {
             }
             streams += 1;
             let data = std::fs::read(&path).unwrap();
-            let counted: u32 = (0..data.len() / PACKET_BYTES)
-                .map(|i| packet(&data, i).unwrap().frames)
-                .sum();
+            let counted = stream_frame_count(&data);
             // Context word 1: sample rate in bits 27-28, stereo in bit 29.
             let ctx = std::fs::read(path.with_extension("ctx")).unwrap();
             let word = u32::from_le_bytes(ctx[4..8].try_into().unwrap());
