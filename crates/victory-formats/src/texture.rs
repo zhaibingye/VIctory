@@ -275,9 +275,12 @@ impl Layout {
             && d.samples.is_power_of_two()
             && d.samples <= 8
             && (d.samples == 1 || (d.dimension == Dimension::Tex2d && d.mips == 1))
-            && (d.dimension != Dimension::Tex1d || d.height == 1)
-            && (d.dimension != Dimension::Tex3d
-                || matches!(d.swizzle.0, 0 | 5 | 9 | 17 | 21 | 24..=27));
+            && match d.dimension {
+                // Gfx10Rsrc1dSwModeMask permits linear, Z and render modes.
+                Dimension::Tex1d => d.height == 1 && matches!(d.swizzle.0, 0 | 24 | 27),
+                Dimension::Tex2d => true,
+                Dimension::Tex3d => matches!(d.swizzle.0, 0 | 5 | 9 | 17 | 21 | 24..=27),
+            };
         if !valid {
             return Err(Error::Invalid);
         }
@@ -852,6 +855,31 @@ mod tests {
             deep.depth = u32::MAX;
             assert_eq!(Layout::new(&deep), Err(Error::Invalid));
         }
+    }
+
+    #[test]
+    fn one_dimensional_textures_accept_only_gfx10_1d_swizzles() {
+        // Addr2ComputeSurfaceInfo on Navi 21, 128 R32 texels in each of three slices.
+        let array = Desc {
+            dimension: Dimension::Tex1d,
+            depth: 3,
+            ..desc(128, 1, 1, 4, Swizzle::SW_4KB_S)
+        };
+        for mode in 0..=27 {
+            let swizzle = Swizzle(mode);
+            let size = Layout::new(&Desc { swizzle, ..array }).map(|layout| layout.size);
+            let expected = match swizzle {
+                Swizzle::LINEAR => Ok(1536),
+                Swizzle::SW_64KB_Z_X | Swizzle::SW_64KB_R_X => Ok(196608),
+                _ => Err(Error::Invalid),
+            };
+            assert_eq!(size, expected, "{swizzle:?}");
+        }
+        let row = Desc {
+            dimension: Dimension::Tex2d,
+            ..array
+        };
+        assert_eq!(Layout::new(&row).unwrap().size, 49152);
     }
 
     #[test]
