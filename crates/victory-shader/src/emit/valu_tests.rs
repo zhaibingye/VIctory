@@ -1493,3 +1493,38 @@ fn relative_moves_reach_only_what_their_clamped_index_can() {
         refused.err()
     );
 }
+#[test]
+fn v_cmp_f_and_t_64bit_match_rdna2() {
+    use crate::dxbc::{Container, FourCC};
+
+    // v_cmp_{f,t}_{i64,u64}_e64 s6, v[1:2], v[3:4]; v_cndmask_b32_e64 v0, 0, 1, s6
+    for (op, name, want) in [
+        (0x0a0u16, "v_cmp_f_i64", 0u32),
+        (0x0a7, "v_cmp_t_i64", 1),
+        (0x0e0, "v_cmp_f_u64", 0),
+        (0x0e7, "v_cmp_t_u64", 1),
+    ] {
+        let cmp = vop3(op, 6, vgpr(1), vgpr(3), 0);
+        let sel = vop3(0x101, 0, 0x80, 0x81, sgpr(6));
+        let shader = build_valu_cs(&[cmp[0], cmp[1], sel[0], sel[1]]);
+        // Constant 64-bit compares must not require the Int64 feature bit (0x8000).
+        let host = Container::parse(&shader.dxil).expect("Container::parse");
+        let sfi0 = host.part(FourCC::SFI0).expect("SFI0").data;
+        let features = u64::from_le_bytes(sfi0.try_into().unwrap());
+        assert_eq!(
+            features & 0x8000,
+            0,
+            "{name} should not set Int64 SFI0 flag: {features:#x}"
+        );
+        run_cases(
+            &shader,
+            &[[0, 0, 0, 0], [0xFFFF_FFFF, 0x7FFF_FFFF, 1, 0x8000_0000]],
+            |backend, _, inp, got| {
+                assert_eq!(
+                    got, want,
+                    "{backend}: {name}({inp:08x?}) = {got}, want {want}"
+                );
+            },
+        );
+    }
+}
