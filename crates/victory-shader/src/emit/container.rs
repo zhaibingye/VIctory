@@ -235,20 +235,17 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
             );
         }
     }
-    // Names of arbitrary semantics (system values use ""), then indices.
+    // Names of arbitrary semantics (system values and unnamed ones use
+    // ""), then indices. Validators before 1.8 compare this part byte for
+    // byte with their own, which writes every name again, repeats
+    // included; 1.8 compares by content and takes either.
     let mut strings = vec![0u8];
     let mut indices: Vec<u32> = Vec::new();
     let mut elements = Vec::new();
     for e in p.inputs.iter().chain(p.outputs).chain(p.prims) {
-        let name = if e.kind == 0 {
-            let needle: Vec<u8> = e.name.bytes().chain([0]).collect();
-            match find(&strings, &needle) {
-                Some(at) => at,
-                None => {
-                    strings.extend(&needle);
-                    strings.len() - needle.len()
-                }
-            }
+        let name = if e.kind == 0 && !e.name.is_empty() {
+            strings.extend(e.name.bytes().chain([0]));
+            strings.len() - e.name.len() - 1
         } else {
             0
         };
@@ -305,10 +302,6 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
         }
     }
     out
-}
-
-fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    hay.windows(needle.len()).position(|w| w == needle)
 }
 
 /// The container: parts in order, hashed.
@@ -404,6 +397,54 @@ fn md5_block(state: &mut [u32; 4], block: &[u8; 64]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// DXC writes one PSV0 name per named arbitrary element, in element
+    /// order and repeats included, and validators before 1.8 refuse the
+    /// part otherwise ("Pipeline State Validation does not match").
+    #[test]
+    fn psv_names_repeat_as_dxc_writes_them() {
+        let el = |name: &str, index, kind, row| SigElement {
+            name: name.into(),
+            index,
+            kind,
+            comp: 9,
+            interp: 0,
+            row: Some(row),
+            col: 0,
+            cols: 4,
+            usage: 15,
+            half: false,
+        };
+        let inputs = [el("TEXCOORD", 0, 0, 0), el("TEXCOORD", 1, 0, 1)];
+        let outputs = [
+            el("SV_Position", 0, 3, 0),
+            el("TEXCOORD", 0, 0, 1),
+            el("", 2, 0, 2),
+            el("COLOR", 0, 0, 3),
+        ];
+        let part = psv(&Psv {
+            stage: 1,
+            flag: true,
+            inputs: &inputs,
+            outputs: &outputs,
+            prims: &[],
+            mesh: None,
+            gs: None,
+            bindings: &[],
+            threads: [0; 3],
+            wave_size: None,
+        });
+        let u32_at = |at: usize| u32::from_le_bytes(part[at..at + 4].try_into().unwrap());
+        // Runtime info size and info, no bindings, then the strings.
+        let at = 4 + u32_at(0) as usize + 4;
+        let len = u32_at(at) as usize;
+        let strings = &part[at + 4..at + 4 + len];
+        assert_eq!(strings, b"\0TEXCOORD\0TEXCOORD\0TEXCOORD\0COLOR\0\0\0");
+        let at = at + 4 + len;
+        let elements = at + 4 + 4 * u32_at(at) as usize + 4;
+        let names: Vec<u32> = (0..6).map(|i| u32_at(elements + 16 * i)).collect();
+        assert_eq!(names, [1, 10, 0, 19, 0, 28]);
+    }
 
     #[test]
     fn md5_core_matches_the_standard() {
