@@ -37,6 +37,9 @@ pub(crate) enum C {
     TexWatched,
     TexHashed,
     TexChanged,
+    TextureQueuedTable,
+    TextureQueuedWithoutRefresh,
+    TextureQueuedBindless,
     /// Time in the kernel's write-watch answers, in the view check of the
     /// guard, in protecting; bytes and time of copies of memory neither
     /// watched nor guarded (copied whole).
@@ -213,6 +216,12 @@ pub(crate) fn log(frames: f64) {
         .collect();
     let mb = |v: f64| v / 1e6;
     let ms = |v: f64| v / 1e3;
+    tracing::info!(
+        "texture copy commands: table {:.1} MB/frame ({:.1} without staging refresh); bindless {:.1} MB/frame (logical payload, not measured PCIe traffic)",
+        mb(c[C::TextureQueuedTable as usize]),
+        mb(c[C::TextureQueuedWithoutRefresh as usize]),
+        mb(c[C::TextureQueuedBindless as usize]),
+    );
     tracing::info!(
         "copies per frame: {:.1} submissions; {:.0} title copies {:.1} MB; {:.0} refreshes {:.1} MB, \
          {:.0} skipped {:.1} MB; {:.0} runs {:.1} ms; {:.0} queries {:.2} ms, moves {:.2} ms, \

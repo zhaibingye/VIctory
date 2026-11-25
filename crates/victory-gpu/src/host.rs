@@ -1986,9 +1986,16 @@ impl HostList {
                     continue;
                 }
                 Step::Texture(staging) => {
-                    if batch.texture_due(staging) {
-                        staging.refresh();
+                    let refreshed = batch.texture_due(staging) && staging.refresh();
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        add(C::TextureQueuedTable, staging.upload_payload);
+                        if !refreshed {
+                            add(C::TextureQueuedWithoutRefresh, staging.upload_payload);
+                        }
                     }
+                    #[cfg(not(feature = "diagnostics"))]
+                    let _ = refreshed;
                     continue;
                 }
                 Step::Heap(viewed) => {

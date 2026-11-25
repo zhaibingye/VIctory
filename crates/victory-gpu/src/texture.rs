@@ -40,6 +40,8 @@ pub(crate) struct Staging {
     /// Its bytes.
     size: u64,
     #[cfg(feature = "diagnostics")]
+    pub(crate) upload_payload: u64,
+    #[cfg(feature = "diagnostics")]
     _upload_bytes: UploadBytes<'static>,
     data: *mut u8,
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
@@ -265,6 +267,8 @@ pub(crate) fn upload_changed(list: &HostList, resource: This, texture: &ID3D12Re
     }
     record(list, resource, texture, &staging);
     list.keep(&staging.buffer);
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::TextureQueuedBindless, staging.upload_payload);
     true
 }
 
@@ -485,6 +489,12 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count as usize];
     let mut rows = vec![0u32; count as usize];
     let mut total = 0;
+    #[cfg(feature = "diagnostics")]
+    let mut row_sizes = vec![0u64; count as usize];
+    #[cfg(feature = "diagnostics")]
+    let row_sizes_out = Some(row_sizes.as_mut_ptr());
+    #[cfg(not(feature = "diagnostics"))]
+    let row_sizes_out = None;
     // SAFETY: outputs for `count` subresources.
     unsafe {
         host.device.GetCopyableFootprints(
@@ -494,10 +504,12 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
             0,
             Some(footprints.as_mut_ptr()),
             Some(rows.as_mut_ptr()),
-            None,
+            row_sizes_out,
             Some(&mut total),
         );
     }
+    #[cfg(feature = "diagnostics")]
+    let upload_payload = logical_upload_bytes(&footprints, &rows, &row_sizes);
     let (buffer, data) = host.upload_buffer(total)?;
     crate::host::name(&buffer, || {
         format!(
@@ -510,6 +522,8 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     let s = Arc::new(Staging {
         buffer,
         size: total,
+        #[cfg(feature = "diagnostics")]
+        upload_payload,
         #[cfg(feature = "diagnostics")]
         _upload_bytes: UploadBytes::new(&LIVE_UPLOAD_BYTES, total),
         data,
@@ -525,9 +539,31 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     Some(s)
 }
 
+/// Logical texture-copy payload, without staging pitch or alignment padding.
+#[cfg(feature = "diagnostics")]
+fn logical_upload_bytes(
+    footprints: &[D3D12_PLACED_SUBRESOURCE_FOOTPRINT],
+    rows: &[u32],
+    row_sizes: &[u64],
+) -> u64 {
+    footprints.iter().zip(rows).zip(row_sizes).fold(0u64, |n, ((f, &rows), &row)| {
+        n.saturating_add(row.saturating_mul(u64::from(rows)).saturating_mul(u64::from(f.Footprint.Depth)))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn logical_upload_does_not_count_pitch_padding() {
+        let footprint = |depth| D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+            Footprint: D3D12_SUBRESOURCE_FOOTPRINT { RowPitch: 256, Depth: depth, ..Default::default() },
+            ..Default::default()
+        };
+        assert_eq!(logical_upload_bytes(&[footprint(1), footprint(2)], &[6, 3], &[40, 20]), 360);
+    }
 
     #[cfg(feature = "diagnostics")]
     #[test]

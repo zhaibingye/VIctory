@@ -71,3 +71,6 @@ pub use watch::{
     Writing as KernelWrite, title_memory_aliased, title_memory_remapped,
     writing as kernel_will_write,
 };
+
+#[cfg(test)]
+mod bc1_detile_experiment;
