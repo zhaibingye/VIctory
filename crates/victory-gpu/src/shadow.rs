@@ -116,22 +116,52 @@ fn pooled(n: usize) -> Vec<u8> {
     v
 }
 
-/// Returns a snapshot buffer to the pool, which keeps the largest up to
-/// [`POOL_BYTES`] in all: a world submission snapshots several copies, and
-/// fresh buffers cost a page fault per 4 KiB touched (millions per frame).
+/// Return a snapshot to the bounded idle cache. Active submissions retain
+/// their snapshots regardless of the budget.
 fn give_back(v: Vec<u8>) {
+    if v.capacity() == 0 || v.capacity() > POOL_BYTES {
+        return;
+    }
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     pool.push(v);
-    pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
-    let mut total = 0;
+    limit_idle(&mut pool, POOL_BYTES, POOL_SLOTS);
+}
+
+fn limit_idle(pool: &mut Vec<Vec<u8>>, budget: usize, slots: usize) {
+    pool.sort_unstable_by_key(|v| std::cmp::Reverse(v.capacity()));
+    let (mut left, mut remaining) = (budget, slots);
     pool.retain(|v| {
-        total += v.capacity();
-        total <= POOL_BYTES
+        let capacity = v.capacity();
+        if remaining == 0 || capacity == 0 || capacity > left {
+            return false;
+        }
+        left -= capacity;
+        remaining -= 1;
+        true
     });
 }
 
-/// Snapshot memory kept for reuse.
-const POOL_BYTES: usize = 2 << 30;
+/// Hard cap for idle CPU snapshot capacity; an outlier is not cached.
+const POOL_BYTES: usize = 256 << 20;
+const POOL_SLOTS: usize = 8;
+
+#[test]
+fn idle_snapshot_pool_stays_bounded_under_outliers() {
+    let caps = [64, 9, 5, 32, 8, 8, 2, 0, 30, 100];
+    let mut pool = Vec::new();
+    for n in caps {
+        pool.push(Vec::with_capacity(n));
+        limit_idle(&mut pool, 50, 4);
+        assert!(pool.iter().map(Vec::capacity).sum::<usize>() <= 50);
+        assert!(pool.len() <= 4);
+    }
+    assert_eq!(pool.iter().map(Vec::capacity).collect::<Vec<_>>(), [32, 9, 8]);
+    pool.push(Vec::with_capacity(1));
+    limit_idle(&mut pool, 50, 4);
+    assert_eq!(pool.iter().map(Vec::capacity).collect::<Vec<_>>(), [32, 9, 8, 1]);
+    limit_idle(&mut pool, 0, 4);
+    assert!(pool.is_empty());
+}
 
 // SAFETY: D3D12 resources are free-threaded; `data` is a persistent mapping
 // written only on the submitting thread.
