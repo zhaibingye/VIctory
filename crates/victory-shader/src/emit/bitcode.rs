@@ -528,6 +528,41 @@ impl Module {
         live
     }
 
+    fn empty_latch_folds(
+        &self,
+        post: &[usize],
+        pos: &[u64],
+        live: &[bool],
+    ) -> Vec<Option<(usize, usize)>> {
+        let succs = |b: usize| successors(self.blocks[b].term);
+        // An empty latch (only a branch back to its loop header) is folded
+        // into its one predecessor, so the exiting block is the latch as in
+        // DXC's loops; the AMD driver hangs on divergent loops otherwise.
+        let mut preds = vec![Vec::new(); self.blocks.len()];
+        for &b in post {
+            for &s in succs(b).iter() {
+                preds[s].push(b);
+            }
+        }
+        let mut fold = vec![None; self.blocks.len()];
+        for &b in post {
+            let blk = &self.blocks[b];
+            if let (Some(Term::Br(h)), true, [p]) = (
+                blk.term,
+                blk.phis.iter().all(|&i| !live[i as usize]) && blk.body.is_empty(),
+                &preds[b][..],
+            ) && pos[h] < pos[b]
+                && !succs(*p).contains(&h)
+                // Folding a sibling latch to this same header would
+                // give its phis two incoming values from one block.
+                && !succs(*p).iter().any(|&s| fold[s] == Some((*p, h)))
+            {
+                fold[b] = Some((*p, h));
+            }
+        }
+        fold
+    }
+
     pub fn write(&self) -> Vec<u8> {
         let mut w = Writer::default();
         w.bytes(b"BC\xC0\xDE");
@@ -691,28 +726,7 @@ impl Module {
         for (n, &b) in post.iter().enumerate() {
             pos[b] = n as u64;
         }
-        // An empty latch (only a branch back to its loop header) is folded
-        // into its one predecessor, so the exiting block is the latch as in
-        // DXC's loops; the AMD driver hangs on divergent loops otherwise.
-        let mut preds = vec![Vec::new(); self.blocks.len()];
-        for &b in &post {
-            for &s in succs(b).iter() {
-                preds[s].push(b);
-            }
-        }
-        let mut fold = vec![None; self.blocks.len()];
-        for &b in &post {
-            let blk = &self.blocks[b];
-            if let (Some(Term::Br(h)), true, [p]) = (
-                blk.term,
-                blk.phis.iter().all(|&i| !live[i as usize]) && blk.body.is_empty(),
-                &preds[b][..],
-            ) && pos[h] < pos[b]
-                && !succs(*p).contains(&h)
-            {
-                fold[b] = Some((*p, h));
-            }
-        }
+        let fold = self.empty_latch_folds(&post, &pos, &live);
         let layout: Vec<usize> = post.into_iter().filter(|&b| fold[b].is_none()).collect();
         let mut pos = vec![u64::MAX; self.blocks.len()];
         for (n, &b) in layout.iter().enumerate() {
@@ -1232,6 +1246,64 @@ mod tests {
             let bytes = synthetic(regs, stages, read).write();
             assert_eq!((bytes.len(), fnv(&bytes)), (len, hash), "{regs}x{stages}");
         }
+    }
+
+    /// When a conditional branch `p` targets two empty latch blocks `b1` and
+    /// `b2` that both jump back to loop header `h`, at most one may be folded
+    /// into `(p, h)`. Folding both would rewrite both edges as coming from
+    /// `%p`, producing invalid LLVM/DXIL PHI records with duplicate incoming
+    /// predecessor blocks carrying different values.
+    #[test]
+    fn twin_empty_latches_from_one_predecessor_do_not_both_fold() {
+        let mut m = Module::default();
+        let i32t = m.int(32);
+        let (entry, head, body, b1, b2, exit) = (
+            m.new_block(),
+            m.new_block(),
+            m.new_block(),
+            m.new_block(),
+            m.new_block(),
+            m.new_block(),
+        );
+        let v0 = m.i32(0);
+        let v1 = m.i32(1);
+        let v2 = m.i32(2);
+        let phi = m.phi(head, i32t);
+        m.set_phi(phi, vec![(v0, entry), (v1, b1), (v2, b2)]);
+        m.terminate(entry, Term::Br(head));
+        let stay = m.cmp(head, pred::EQ, phi, v0);
+        m.terminate(head, Term::CondBr(stay, body, exit));
+        let branch = m.cmp(body, pred::EQ, phi, v1);
+        m.terminate(body, Term::CondBr(branch, b1, b2));
+        m.terminate(b1, Term::Br(head));
+        m.terminate(b2, Term::Br(head));
+        m.terminate(exit, Term::Ret);
+
+        let post = vec![entry, head, body, b1, b2, exit];
+        let mut pos = vec![u64::MAX; m.blocks.len()];
+        for (n, &b) in post.iter().enumerate() {
+            pos[b] = n as u64;
+        }
+        let fold = m.empty_latch_folds(&post, &pos, &m.live());
+        // Exactly one of (b1, b2) folds; the other remains its own block so
+        // `head`'s PHI incoming predecessor block IDs stay pairwise distinct.
+        let folded_count = [b1, b2].iter().filter(|&&b| fold[b].is_some()).count();
+        assert_eq!(
+            folded_count, 1,
+            "only one empty latch from `body` to `head` may fold"
+        );
+        let layout: Vec<usize> = post.into_iter().filter(|&b| fold[b].is_none()).collect();
+        let mut layout_pos = vec![u64::MAX; m.blocks.len()];
+        for (n, &b) in layout.iter().enumerate() {
+            layout_pos[b] = n as u64;
+        }
+        let from = |b: usize| fold[b].map_or(layout_pos[b], |(p, _)| layout_pos[p]);
+        let preds = [from(entry), from(b1), from(b2)];
+        assert_ne!(preds[0], preds[1]);
+        assert_ne!(preds[0], preds[2]);
+        assert_ne!(preds[1], preds[2]);
+        // And writing the module completes cleanly.
+        assert!(!m.write().is_empty());
     }
 
     #[test]
