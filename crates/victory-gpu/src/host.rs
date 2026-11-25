@@ -821,6 +821,39 @@ struct Deferred {
 }
 
 impl Host {
+    // Identity-preserving, monotonic additions to a reserved BC texture's
+    // tile map. Recording/refresh ordering requires the same direct queue;
+    // a refreshing submission already holds the submission mutex.
+    pub(crate) fn map_sparse(
+        &self,
+        texture: &ID3D12Resource,
+        first: u32,
+        heap: &ID3D12Heap,
+        count: u32,
+    ) {
+        let start = D3D12_TILED_RESOURCE_COORDINATE {
+            Subresource: first,
+            ..Default::default()
+        };
+        let region = D3D12_TILE_REGION_SIZE {
+            NumTiles: count,
+            ..Default::default()
+        };
+        unsafe {
+            self.queue.UpdateTileMappings(
+                texture,
+                1,
+                Some(&start),
+                Some(&region),
+                heap,
+                1,
+                Some(&D3D12_TILE_RANGE_FLAG_NONE),
+                Some(&0),
+                Some(&count),
+                D3D12_TILE_MAPPING_FLAG_NONE,
+            );
+        }
+    }
     /// Whether the host runs mesh shaders at shader model 6.6 (translated
     /// mesh shaders need both); logged once.
     pub(crate) fn mesh_shaders(&self) -> bool {

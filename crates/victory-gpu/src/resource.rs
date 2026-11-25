@@ -770,6 +770,7 @@ struct Resource {
 /// element size share it, each viewing it in its own format.
 #[cfg(windows)]
 pub(crate) struct HostTexture {
+    pub(crate) sparse: Option<crate::sparse::Sparse>,
     pub(crate) texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
     pub(crate) state: std::sync::atomic::AtomicU32,
     /// Formats views may take besides the texture's own family: the host
@@ -797,13 +798,29 @@ impl HostTexture {
         state: u32,
         castable: Vec<u32>,
     ) -> Self {
-        let bytes = crate::host::host().map_or(0, |h| {
-            // SAFETY: plain queries on a live resource.
-            unsafe { h.device.GetResourceAllocationInfo(0, &[texture.GetDesc()]) }.SizeInBytes
-        });
+        Self::with_backing(texture, state, castable, None)
+    }
+
+    fn with_backing(
+        texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+        state: u32,
+        castable: Vec<u32>,
+        sparse: Option<crate::sparse::Sparse>,
+    ) -> Self {
+        // Sparse backing keeps its own physical-byte counters and
+        // updates them only after a successful tile mapping.
+        let bytes = if sparse.is_some() {
+            0
+        } else {
+            crate::host::host().map_or(0, |h| {
+                // SAFETY: plain queries on a live resource.
+                unsafe { h.device.GetResourceAllocationInfo(0, &[texture.GetDesc()]) }.SizeInBytes
+            })
+        };
         TEXTURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         TEXTURE_BYTES.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
         HostTexture {
+            sparse,
             texture,
             state: state.into(),
             castable,
@@ -818,7 +835,9 @@ impl HostTexture {
     /// A list uses it: counted the first time (diagnostics of how much of
     /// the host textures' memory the GPU ever touches).
     pub(crate) fn note_used(&self) {
-        if !self.used.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        if let Some(sparse) = &self.sparse {
+            sparse.note_used();
+        } else if !self.used.swap(true, std::sync::atomic::Ordering::Relaxed) {
             USED.fetch_add(self.bytes, std::sync::atomic::Ordering::Relaxed);
         }
     }
@@ -851,8 +870,15 @@ static REPLACED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::ne
 #[cfg(windows)]
 pub(crate) fn texture_counts() -> (u64, u64, u64, u64, u64, u64) {
     use std::sync::atomic::Ordering::Relaxed;
-    let shared = (SHARED.load(Relaxed), SAVED.load(Relaxed), REPLACED.load(Relaxed));
-    (TEXTURES.load(Relaxed), TEXTURE_BYTES.load(Relaxed), USED.load(Relaxed), shared.0, shared.1, shared.2)
+    let (mapped, sparse_used) = crate::sparse::counts();
+    (
+        TEXTURES.load(Relaxed),
+        TEXTURE_BYTES.load(Relaxed) + mapped,
+        USED.load(Relaxed) + sparse_used,
+        SHARED.load(Relaxed),
+        SAVED.load(Relaxed),
+        REPLACED.load(Relaxed),
+    )
 }
 
 #[cfg(windows)]
@@ -1106,12 +1132,29 @@ fn shared_texture(
     desc: &ResourceDesc,
     state: u32,
     clear: *const c_void,
+    sparse_prefix: u32,
 ) -> Option<std::sync::Arc<HostTexture>> {
     let d = host_desc(desc)?;
     let key = memory_key(address, desc);
     let mut map = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
     let map = map.get_or_insert_with(Default::default);
     let live = key.and_then(|k| map.get(&k)?.upgrade());
+    if live.is_none() && key.is_some() && sparse_prefix != 0 {
+        use windows::Win32::Graphics::Direct3D12::*;
+        // SAFETY: host_desc normalizes the repr(C) resource description.
+        let mut pc = unsafe { std::ptr::from_ref(&d).cast::<D3D12_RESOURCE_DESC>().read_unaligned() };
+        // A placed view may select sRGB or linear later. A BC1 typeless
+        // resource supports both without extra physical allocations.
+        pc.Format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_BC1_TYPELESS;
+        let initial = crate::host::legal_for(d.flags, crate::host::texture_state(state));
+        if let Some((texture, sparse)) = crate::sparse::Sparse::try_new(
+            pc, D3D12_RESOURCE_STATES(initial as i32), sparse_prefix,
+        ) {
+            return Some(std::sync::Arc::new(HostTexture::with_backing(
+                texture, initial, Vec::new(), Some(sparse),
+            )));
+        }
+    }
     if let Some(t) = &live
         && takes(t, &d)
     {
@@ -1164,6 +1207,12 @@ fn current(this: This) -> bool {
     let (Some(h), Some(k)) = (&r.host, memory_key(r.data() as u64, &r.desc)) else {
         return true;
     };
+    // The private placed allocation is also the identity of already-made
+    // descriptors. An ordinary resource appearing later cannot replace it;
+    // the same-address GPU-writable alias path copies into it instead.
+    if h.sparse.is_some() {
+        return true;
+    }
     let map = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
     map.as_ref()
         .and_then(|m| m.get(&k)?.upgrade())
@@ -1360,9 +1409,10 @@ fn hand_out_resource(
     clear: *const c_void,
     iid: *const Iid,
     out: *mut This,
+    sparse_prefix: u32,
 ) -> HRESULT {
     #[cfg(not(windows))]
-    let _ = (state, clear);
+    let _ = (state, clear, sparse_prefix);
     #[allow(unused_mut)] // the host texture is set on Windows only
     let mut resource = Box::new(Resource {
         object: Object::new(&RESOURCE_FUNCTIONS),
@@ -1375,7 +1425,7 @@ fn hand_out_resource(
     });
     #[cfg(windows)]
     {
-        resource.host = shared_texture(resource.data() as u64, &desc, state, clear);
+        resource.host = shared_texture(resource.data() as u64, &desc, state, clear, sparse_prefix);
     }
     #[cfg(windows)]
     if desc.dimension == BUFFER {
@@ -1514,6 +1564,7 @@ pub(crate) extern "system" fn create_committed(
         clear,
         iid,
         out,
+        0,
     )
 }
 
@@ -1599,6 +1650,18 @@ pub(crate) extern "system" fn create_at_address(
     let Some(&desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
     };
+    address_resource(address, desc, layout, clear, iid, out, 0)
+}
+
+fn address_resource(
+    address: u64,
+    desc: ResourceDesc,
+    layout: u32,
+    clear: *const c_void,
+    iid: *const Iid,
+    out: *mut This,
+    sparse_prefix: u32,
+) -> HRESULT {
     if address == 0 {
         return E_INVALIDARG;
     }
@@ -1626,6 +1689,7 @@ pub(crate) extern "system" fn create_at_address(
         clear,
         iid,
         out,
+        sparse_prefix,
     )
 }
 
@@ -1640,10 +1704,86 @@ pub(crate) extern "system" fn create_at_address(
 static PLACED_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<(u64, [u32; 14]), usize>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
+#[cfg(windows)]
+/// Return the detailed mip prefix the initial SRV does not expose and
+/// whose console pages are all absent. Never infer absence from protection
+/// flags, since a guarded/NOACCESS committed page may still contain data.
+fn sparse_missing_prefix(
+    desc: &ResourceDesc,
+    srv: &windows::Win32::Graphics::Direct3D12::D3D12_SHADER_RESOURCE_VIEW_DESC,
+    address: usize,
+) -> u32 {
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::*;
+    if desc.dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D.0 as u32
+        || desc.depth_or_array_size != 1
+        || desc.sample_count != 1
+        || desc.flags & 0xf != 0
+        || desc.width < 512
+        || desc.height < 512
+        || srv.ViewDimension != D3D12_SRV_DIMENSION_TEXTURE2D
+        || !matches!(srv.Format, DXGI_FORMAT_BC1_UNORM | DXGI_FORMAT_BC1_UNORM_SRGB)
+        || !(desc.format == DXGI_FORMAT_BC1_TYPELESS.0 as u32 || desc.format == srv.Format.0 as u32)
+    {
+        return 0;
+    }
+    // SAFETY: the dimension was checked above.
+    let view = unsafe { srv.Anonymous.Texture2D };
+    let first = view.MostDetailedMip;
+    let mips = u32::from(desc.mip_levels);
+    if first == 0
+        || first >= mips
+        || view.MipLevels == 0
+        || (view.MipLevels != u32::MAX && view.MipLevels > mips - first)
+        || view.PlaneSlice != 0
+    {
+        return 0;
+    }
+    let Some(layout) = texture_layout(desc) else {
+        return 0;
+    };
+    let layout = &layout.planes[0].layout;
+    if layout.slices != 1 || layout.desc.swizzle.xor() {
+        return 0;
+    }
+    let query = |at: usize| {
+        use windows_sys::Win32::System::Memory::*;
+        let mut info = MEMORY_BASIC_INFORMATION::default();
+        // SAFETY: VirtualQuery describes the address without reading the
+        // texture data and writes only to the local information structure.
+        if unsafe { VirtualQuery(at as _, &mut info, size_of_val(&info)) } != size_of_val(&info) {
+            return None;
+        }
+        let base = info.BaseAddress as usize;
+        (base <= at).then_some(())?;
+        Some((base.checked_add(info.RegionSize)?, matches!(info.State, MEM_RESERVE | MEM_FREE)))
+    };
+    let mut end = layout.slice_size;
+    let mut missing = 0;
+    for mip in layout.mips.iter().take(first.min(layout.first_tail_mip) as usize) {
+        let extent = (|| {
+            let start = address.checked_add(usize::try_from(mip.offset).ok()?)?;
+            let end = address.checked_add(usize::try_from(end).ok()?)?;
+            Some((start, end))
+        })();
+        let Some((lo, hi)) = extent else { break };
+        if !crate::sparse::wholly_absent(lo, hi, query) {
+            break;
+        }
+        missing += 1;
+        end = mip.offset;
+    }
+    missing
+}
+
 /// The resource for a texture placed at `address` with the resource
 /// description `desc` (as words), made on first use.
 #[cfg(windows)]
-pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
+pub(crate) fn texture_at(
+    address: u64,
+    desc: &[u32; 14],
+    view: &windows::Win32::Graphics::Direct3D12::D3D12_SHADER_RESOURCE_VIEW_DESC,
+) -> Option<This> {
     let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
     // Words 1 and 13 are padding (stack bytes in the title's records).
     let mut desc = *desc;
@@ -1663,15 +1803,19 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     if d.dimension == BUFFER {
         return None;
     }
+    // Never select sparse backing where an existing title texture can
+    // already have written this memory, or when replacing a generation.
+    let sparse_prefix = if crate::sparse::enabled()
+        && !map.contains_key(&(address, *desc))
+        && !TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&address)
+    {
+        sparse_missing_prefix(&d, view, usize::try_from(address).ok()?)
+    } else {
+        0
+    };
     let mut out = std::ptr::null();
-    let made = create_at_address(
-        std::ptr::null(),
-        address,
-        &d,
-        0,
-        std::ptr::null(),
-        &RESOURCE_IIDS[0],
-        &mut out,
+    let made = address_resource(
+        address, d, 0, std::ptr::null(), &RESOURCE_IIDS[0], &mut out, sparse_prefix,
     );
     if made != S_OK {
         return None;
@@ -1725,6 +1869,7 @@ pub(crate) extern "system" fn create_placed(
         clear,
         iid,
         out,
+        0,
     )
 }
 

@@ -36,6 +36,7 @@ macro_rules! once {
 /// A texture's upload state: the staging buffer laid out as the host
 /// texture's subresources, and what was last detiled.
 pub(crate) struct Staging {
+    sparse_host: std::sync::Weak<crate::resource::HostTexture>,
     buffer: ID3D12Resource,
     /// Its bytes.
     size: u64,
@@ -61,6 +62,7 @@ pub(crate) struct Staging {
 #[derive(Default)]
 struct Last {
     hash: Option<blake3::Hash>,
+    sparse_first: Option<u32>,
 }
 
 /// Shared scratch buffer for reading tracked title-texture memory before
@@ -154,7 +156,12 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
         return;
     }
     // SAFETY: live resources.
-    let (da, db) = unsafe { (a.GetDesc(), b.GetDesc()) };
+    let (da, mut db) = unsafe { (a.GetDesc(), b.GetDesc()) };
+    let destination = crate::resource::host_copy(to);
+    let sparse = destination.as_ref().and_then(|h| h.sparse.as_ref());
+    if sparse.is_some() {
+        db.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    }
     let count = |d: &D3D12_RESOURCE_DESC| {
         if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
             u32::from(d.MipLevels)
@@ -188,6 +195,16 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
         return;
     }
     let Some(buffer) = host.default_buffer(total) else { return };
+    let first = sparse.map_or(0, |s| {
+        // GPU-produced aliases cannot be detected by refresh() at all.
+        // Map their detailed mips before the alias copy runs, in the same
+        // direct queue, or keep serving only the already-resident suffix.
+        s.promote(b, 0);
+        s.first()
+    });
+    if first >= n {
+        return;
+    }
     list.keep(&buffer);
     crate::texture::host_written(to);
     crate::list::ensure_state(list, from, COPY_SOURCE);
@@ -207,7 +224,7 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
     let l = &list.list;
     // SAFETY: an open list; live resources in the states named.
     unsafe {
-        for i in 0..n {
+        for i in first..n {
             l.CopyTextureRegion(&place(&buffer, fa[i as usize]), 0, 0, 0, &sub(a, i), None);
         }
         l.ResourceBarrier(&[crate::host::transition(
@@ -215,7 +232,7 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
             D3D12_RESOURCE_STATE_COPY_DEST,
             D3D12_RESOURCE_STATE_COPY_SOURCE,
         )]);
-        for i in 0..n {
+        for i in first..n {
             l.CopyTextureRegion(&sub(b, i), 0, 0, 0, &place(&buffer, fb[i as usize]), None);
         }
     }
@@ -345,8 +362,11 @@ impl Staging {
         let start = self.memory as usize;
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
         let last = &mut *last;
+        let sparse = self.sparse_host.upgrade();
+        let first = sparse.as_ref().and_then(|h| h.sparse.as_ref()).map(|s| s.first());
+        let new_backing = first != last.sparse_first;
         if let Some(t) = &self.tracked {
-            if t.take(start, start + size).is_empty() {
+            if t.take(start, start + size).is_empty() && !new_backing {
                 return (0, false);
             }
             // Read through the copy, which stands unmapped pages: memory of
@@ -355,8 +375,24 @@ impl Staging {
             scratch.resize(size, 0);
             crate::host::copy_mapped(scratch.as_mut_ptr(), self.memory, size, false);
             self.detile(&scratch);
+            last.sparse_first = first;
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
+            return (size, true);
+        }
+        // A sparse texture may have committed small levels with absent
+        // large levels. Read through the existing mapped-page fallback.
+        if first.is_some() {
+            let mut scratch = READ_SCRATCH.lock().unwrap_or_else(|e| e.into_inner());
+            scratch.resize(size, 0);
+            crate::host::copy_mapped(scratch.as_mut_ptr(), self.memory, size, false);
+            let hash = blake3::hash(&scratch);
+            if last.hash == Some(hash) && !new_backing {
+                return (size, false);
+            }
+            self.detile(&scratch);
+            last.hash = Some(hash);
+            last.sparse_first = first;
             return (size, true);
         }
         if !committed(self.memory, size) {
@@ -386,6 +422,21 @@ impl Staging {
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8]) {
+        if let Some(h) = self.sparse_host.upgrade()
+            && let Some(s) = &h.sparse
+        {
+            let mut end = self.layout.slice_size as usize;
+            for (i, mip) in self.layout.mips.iter().take(s.first() as usize).enumerate() {
+                let at = mip.offset as usize;
+                if tiled.get(at..end).is_none_or(|span| span.iter().any(|&b| b != 0)) {
+                    // A recorded list will copy every level. Map the data
+                    // before the list executes even if its view hides it.
+                    s.promote(&h.texture, i as u32);
+                    break;
+                }
+                end = at;
+            }
+        }
         #[cfg(feature = "diagnostics")]
         if tiled.iter().all(|&b| b == 0) {
             tracing::debug!(
@@ -480,7 +531,12 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     }
     let host = host()?;
     // SAFETY: a live resource.
-    let d = unsafe { texture.GetDesc() };
+    let mut d = unsafe { texture.GetDesc() };
+    if copy.sparse.is_some() {
+        // A staging footprint describes the linear copy, not the reserved
+        // destination's hardware tile swizzle.
+        d.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    }
     let count = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
         u32::from(d.MipLevels)
     } else {
@@ -520,6 +576,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
     let layout_size = layout.size as usize;
     let s = Arc::new(Staging {
+        sparse_host: if copy.sparse.is_some() { Arc::downgrade(&copy) } else { std::sync::Weak::new() },
         buffer,
         size: total,
         #[cfg(feature = "diagnostics")]

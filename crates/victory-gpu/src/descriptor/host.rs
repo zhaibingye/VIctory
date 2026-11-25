@@ -1191,6 +1191,11 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 if desc.is_none() && !default_view(resource) {
                     return None;
                 }
+                if let Some(sparse) = &copy.sparse {
+                    let srv = desc.as_mut()?;
+                    let mips = u32::from(unsafe { texture.GetDesc() }.MipLevels);
+                    crate::sparse::resident_srv(sparse, texture, srv, mips)?;
+                }
                 if !fits(texture, &copy.castable, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
                 }
@@ -1304,8 +1309,9 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
         return None;
     }
     let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-    let texture = crate::resource::texture_at(address, resource)?;
-    Some(View::Shader(texture as usize, desc[..10].try_into().ok()))
+    let words: [u32; 10] = desc[..10].try_into().ok()?;
+    let texture = crate::resource::texture_at(address, resource, &srv_desc(&words))?;
+    Some(View::Shader(texture as usize, Some(words)))
 }
 
 /// A null view of the kind `view` is, for a slot whose view the host

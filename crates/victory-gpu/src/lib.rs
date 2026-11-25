@@ -58,6 +58,8 @@ mod switch;
 #[cfg(windows)]
 mod tdr;
 #[cfg(windows)]
+mod sparse;
+#[cfg(windows)]
 mod texture;
 #[cfg(windows)]
 mod twin;
