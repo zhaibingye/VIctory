@@ -177,7 +177,7 @@ fn left_kind(view: &View) -> usize {
     match view {
         View::Placed(_, resource, _) if resource[0] != 1 => 2,
         View::Unordered(..) | View::Placed(true, ..) => 1,
-        View::Shader(..) | View::Placed(false, ..) | View::Constant(..) => 0,
+        View::Shader(..) | View::Placed(false, ..) | View::Constant(..) | View::NullConstant => 0,
         _ => 3,
     }
 }

@@ -766,7 +766,7 @@ fn uav_desc(words: &[u32; 10]) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
 fn view_stride(view: &View) -> u32 {
     let (unordered, words): (bool, &[u32; 10]) = match view {
         // Read as raw buffers (`make`).
-        View::Constant(..) => return 4,
+        View::Constant(..) | View::NullConstant => return 4,
         View::Shader(_, Some(desc)) => (false, desc),
         View::Unordered(_, _, Some(desc)) => (true, desc),
         View::Placed(unordered, resource, desc) if resource[0] == 1 => {
@@ -1186,6 +1186,13 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             };
             buffer_srv(address, bytes, desc, at)
         }
+        View::NullConstant => {
+            // A buffer read through a heap index takes a raw SRV on the host
+            // even when the title called it a constant buffer, so the null
+            // that stands in for it is the same null buffer view.
+            null_buffer_view(at);
+            Some(None)
+        }
         View::Shader(resource, desc) => {
             let resource = *resource as crate::object::This;
             if let Some(copy) = crate::resource::host_copy(resource) {
@@ -1359,7 +1366,7 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
             return null_like(desc[..10].try_into().unwrap_or(&[0; 10]), at);
         }
         // Read as raw buffers, as made (`make`).
-        View::Constant(..) => return null_buffer_view(at),
+        View::Constant(..) | View::NullConstant => return null_buffer_view(at),
         _ => return null_view(at),
     };
     let desc = if buffer {
@@ -1580,6 +1587,20 @@ mod tests {
         };
         let view = View::Unordered(0, 0, Some([28, 8, 0, 0, 0, 0, 0, 0, 0, 0]));
         null_for(&view, heap.cpu(0));
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    /// A null description clears the host CBV slot without removing the device.
+    #[test]
+    fn null_constant_buffer_view_is_accepted_by_the_device() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        assert!(make(&View::NullConstant, heap.cpu(0)).is_some());
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }

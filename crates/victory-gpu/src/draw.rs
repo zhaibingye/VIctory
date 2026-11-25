@@ -2067,6 +2067,62 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
     }
 
+    /// Heap and table CBVs use raw SRVs in translated shaders. Clearing the
+    /// title CBV must leave a null raw SRV of the same kind in the host slot.
+    #[test]
+    fn cleared_constant_view_reads_zero_as_a_raw_buffer() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let shader = compile_cs(
+            r#"
+#define RS "DescriptorTable(SRV(t0)), UAV(u0)"
+ByteAddressBuffer cb : register(t0);
+RWByteAddressBuffer out_value : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() { out_value.Store(0, cb.Load(0)); }
+"#,
+        );
+        let slots = Slots::new(1);
+        // SAFETY: a live, shader-visible view heap.
+        let at = unsafe { slots.0.GetCPUDescriptorHandleForHeapStart() };
+        let (out, readback) = host.shared_buffer(4).unwrap();
+        let buffer = crate::resource::test_buffer(16);
+        let (memory, _) = crate::resource::buffer_bytes(buffer).unwrap();
+        let address = memory as u64;
+        let value = 0x1122_3344u32;
+        // SAFETY: the aligned start of the title's 16-byte buffer.
+        unsafe { memory.cast::<u32>().write(value) };
+        let cbv = [address as u32, (address >> 32) as u32, 16, 0];
+        let mut storage = [0u64; 4];
+        let handle = storage.as_mut_ptr() as u64;
+        let mut got = Vec::new();
+        for desc in [&cbv as *const [u32; 4], std::ptr::null()] {
+            crate::descriptor::create_cbv(std::ptr::null(), desc, handle);
+            let view = crate::descriptor::view(handle).unwrap();
+            let _resource = crate::descriptor::host::make_view(&view, at);
+            let list = host.new_list().unwrap();
+            readable(&list, &used(ResourceType::Cbv), &view, false);
+            // SAFETY: the shader outputs to this shared buffer.
+            unsafe { readback.cast::<u32>().write(0xdead_beef) };
+            run(&list, &slots, &shader, 0, Some(&out), (1, 1));
+            list.close();
+            host.execute(&[&list]);
+            // SAFETY: the dispatch finished and the four bytes are mapped.
+            got.push(unsafe { readback.cast::<u32>().read() });
+        }
+        let release = crate::object::slot::<extern "system" fn(This) -> u32>(buffer, 0x10);
+        assert_eq!(release(buffer), 0);
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+        assert_eq!(
+            got,
+            [value, 0],
+            "raw constant view before and after clearing"
+        );
+    }
+
     /// Slots of a shader-visible view heap of ours.
     struct Slots(ID3D12DescriptorHeap, u32);
 

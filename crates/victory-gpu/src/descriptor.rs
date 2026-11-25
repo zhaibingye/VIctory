@@ -342,6 +342,8 @@ const DSV_TAG: u32 = u32::from_le_bytes(*b"vDSV");
 pub(crate) enum View {
     /// Constant buffer: GPU address and size.
     Constant(u64, u32),
+    /// A null constant-buffer descriptor.
+    NullConstant,
     /// Shader resource: resource, description (none: the resource's own).
     Shader(usize, Option<[u32; 10]>),
     /// Unordered access: resource, counter resource, description.
@@ -480,6 +482,8 @@ pub(crate) extern "system" fn create_cbv(_: This, desc: *const [u32; 4], handle:
     if let Some([lo, hi, size, _]) = words(desc) {
         let address = u64::from(lo) | u64::from(hi) << 32;
         record(handle, View::Constant(address, size));
+    } else {
+        record(handle, View::NullConstant);
     }
 }
 
@@ -783,11 +787,14 @@ mod tests {
     #[test]
     fn views_survive_copies() {
         let null = std::ptr::null();
-        let mut heap = vec![0u64; 4 * 8]; // four 32-byte slots
+        let mut heap = vec![0u64; 5 * 8]; // five 32-byte slots
         let at = |i: usize| heap.as_ptr() as u64 + 32 * i as u64;
-        let (s0, s1, s2, s3) = (at(0), at(1), at(2), at(3));
+        let (s0, s1, s2, s3, s4) = (at(0), at(1), at(2), at(3), at(4));
         create_cbv(null, &[0x1000, 1, 256, 0], s0);
         assert_eq!(view(s0), Some(View::Constant(0x1_0000_1000, 256)));
+        create_cbv(null, &[0x2000, 1, 256, 0], s4);
+        create_cbv(null, std::ptr::null(), s4);
+        assert_eq!(view(s4), Some(View::NullConstant));
         create_srv(null, null, std::ptr::null(), s1);
         assert_eq!(view(s1), Some(View::Shader(0, None)));
         // The same view twice is one entry.
