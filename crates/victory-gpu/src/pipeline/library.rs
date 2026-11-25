@@ -19,13 +19,20 @@
 //!    The list holds only for the library bytes it was saved with and for
 //!    what names the pipelines (the translator, this module and `host`).
 //!
-//! All library calls are serialised: the interface does not promise that
-//! stores, loads and serialising may overlap.
+//! The library is free-threaded but for loads of one pipeline on several
+//! threads (`ID3D12Device1::CreatePipelineLibrary`, "Thread Safety"), so
+//! pipelines of different names load at the same time. A load is not always
+//! quick: the library of an AMD driver holds about 140 bytes per pipeline,
+//! and what its own cache lacks is compiled inside the load, for seconds.
+//! Loaded one at a time, 650 pipelines kept the eight workers to one core
+//! for minutes, while each title frame could wait out its 500 ms for
+//! them (`make`). Stores and serialising keep the lock: the size asked for
+//! must still be right when the bytes are written.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Condvar, Mutex, OnceLock};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::{HSTRING, Interface, PCWSTR};
@@ -55,9 +62,54 @@ struct Library {
     prebuilt_changed: bool,
 }
 
-// SAFETY: D3D12 objects are free-threaded; every call is made under the
-// mutex that holds the library.
+// SAFETY: D3D12 objects are free-threaded (a pipeline library with the
+// exception `NAMES` takes care of).
 unsafe impl Send for Library {}
+
+/// Names one thread at a time holds.
+struct Names {
+    held: Mutex<Option<HashSet<String>>>,
+    released: Condvar,
+}
+
+/// A name held until this is dropped.
+struct Held<'a> {
+    names: &'a Names,
+    name: &'a str,
+}
+
+impl Names {
+    const fn new() -> Names {
+        Names {
+            held: Mutex::new(None),
+            released: Condvar::new(),
+        }
+    }
+
+    /// Holds `name`, once no other thread does.
+    fn hold<'a>(&'a self, name: &'a str) -> Held<'a> {
+        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        while held.as_ref().is_some_and(|h| h.contains(name)) {
+            held = self.released.wait(held).unwrap_or_else(|e| e.into_inner());
+        }
+        held.get_or_insert_default().insert(name.to_owned());
+        Held { names: self, name }
+    }
+}
+
+impl Drop for Held<'_> {
+    fn drop(&mut self) {
+        let mut held = self.names.held.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(h) = held.as_mut() {
+            h.remove(self.name);
+        }
+        drop(held);
+        self.names.released.notify_all();
+    }
+}
+
+/// Pipelines being loaded, or made and stored.
+static NAMES: Names = Names::new();
 
 const LIBRARY_FILE: &str = "host-pipelines.bin";
 const EARLY_FILE: &str = "early-pipelines.txt";
@@ -188,7 +240,9 @@ pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> Stri
 }
 
 /// The pipeline named `name`: loaded from the library by `load` if it is
-/// there with the same description, else made by `create` and stored.
+/// there with the same description, else made by `create` and stored. A
+/// name asked for by several threads is loaded or made by one at a time
+/// (the others then find it in the library); different names overlap.
 pub(crate) fn pipeline(
     name: &str,
     load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
@@ -201,7 +255,15 @@ pub(crate) fn pipeline(
         MADE.fetch_add(1, Ordering::Relaxed);
         return create();
     };
-    if let Ok(pso) = load(&library.lock().unwrap_or_else(|e| e.into_inner()).library, PCWSTR(wide.as_ptr())) {
+    let _held = NAMES.hold(name);
+    // The interface alone under the lock: loads take up to seconds. Its
+    // blob lives as long as the library, which is never dropped.
+    let loads = library
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .library
+        .clone();
+    if let Ok(pso) = load(&loads, PCWSTR(wide.as_ptr())) {
         LOADED.fetch_add(1, Ordering::Relaxed);
         return Ok(pso);
     }
@@ -404,6 +466,167 @@ mod tests {
         assert_eq!(listed(saved.as_bytes(), &tag(b"library")), keys);
         assert!(listed(saved.as_bytes(), &tag(b"library2")).is_empty());
         assert!(listed(b"", &tag(b"library")).is_empty());
+    }
+
+    #[test]
+    fn different_names_are_held_at_the_same_time() {
+        static NAMES: Names = Names::new();
+        // Each thread holds its name until every thread holds its own.
+        let all = std::sync::Barrier::new(8);
+        std::thread::scope(|s| {
+            for i in 0..8 {
+                let all = &all;
+                s.spawn(move || {
+                    let name = format!("pipeline {i}");
+                    let _held = NAMES.hold(&name);
+                    all.wait();
+                });
+            }
+        });
+        assert!(NAMES.held.lock().unwrap().as_ref().unwrap().is_empty());
+    }
+
+    #[test]
+    fn one_name_is_held_by_one_thread_at_a_time() {
+        static NAMES: Names = Names::new();
+        static INSIDE: AtomicU64 = AtomicU64::new(0);
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                s.spawn(|| {
+                    for _ in 0..500 {
+                        let _held = NAMES.hold("pipeline");
+                        assert_eq!(INSIDE.fetch_add(1, Ordering::SeqCst), 0);
+                        std::hint::spin_loop();
+                        INSIDE.fetch_sub(1, Ordering::SeqCst);
+                    }
+                });
+            }
+        });
+        // A holder that panics lets go of it.
+        let panicked = std::thread::spawn(|| {
+            let _held = NAMES.hold("pipeline");
+            panic!("on purpose");
+        });
+        assert!(panicked.join().is_err());
+        drop(NAMES.hold("pipeline"));
+    }
+
+    /// A library's pipelines load on many threads at once, each with its
+    /// own description (a load with another's is refused), while others are
+    /// stored and the library is serialised.
+    #[test]
+    fn pipelines_load_on_many_threads_at_once() {
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::core::s;
+        const N: usize = 48;
+        let Some(device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok())
+        else {
+            return; // no host GPU here
+        };
+        let shader = |i: usize| {
+            let source = format!(
+                "#define RS \"UAV(u0)\"\nRWByteAddressBuffer b : register(u0);\n\
+                 [RootSignature(RS)] [numthreads(1, 1, 1)] void main() {{ b.Store(0, b.Load(4) * {i} + {i}); }}"
+            );
+            let mut blob = None;
+            // SAFETY: the source outlives the call; the blob is read within it.
+            unsafe {
+                D3DCompile(
+                    source.as_ptr().cast(),
+                    source.len(),
+                    None,
+                    None,
+                    None,
+                    s!("main"),
+                    s!("cs_5_1"),
+                    0,
+                    0,
+                    &mut blob,
+                    None,
+                )
+                .ok()?;
+                let blob = blob?;
+                Some(
+                    std::slice::from_raw_parts(
+                        blob.GetBufferPointer().cast::<u8>(),
+                        blob.GetBufferSize(),
+                    )
+                    .to_vec(),
+                )
+            }
+        };
+        let Some(codes) = (0..2 * N).map(shader).collect::<Option<Vec<_>>>() else {
+            return; // no shader compiler here
+        };
+        // SAFETY: the code holds its root signature.
+        let root: ID3D12RootSignature =
+            unsafe { device.CreateRootSignature(0, &codes[0]) }.unwrap();
+        struct Shared(ID3D12Device1, ID3D12RootSignature, ID3D12PipelineLibrary1);
+        // SAFETY: D3D12 objects are free-threaded.
+        unsafe impl Sync for Shared {}
+        impl Shared {
+            fn desc(&self, code: &[u8]) -> D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    // SAFETY: a borrowed pointer the description never releases.
+                    pRootSignature: unsafe { std::mem::transmute_copy(&self.1) },
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: code.as_ptr().cast(),
+                        BytecodeLength: code.len(),
+                    },
+                    ..Default::default()
+                }
+            }
+            fn store(&self, i: usize, code: &[u8]) {
+                let name = HSTRING::from(format!("p{i}"));
+                // SAFETY: the description points at live data.
+                unsafe {
+                    let pso: ID3D12PipelineState =
+                        self.0.CreateComputePipelineState(&self.desc(code)).unwrap();
+                    self.2.StorePipeline(&name, &pso).unwrap();
+                }
+            }
+            fn load(&self, i: usize, code: &[u8]) -> windows::core::Result<ID3D12PipelineState> {
+                let name = HSTRING::from(format!("p{i}"));
+                // SAFETY: as above.
+                unsafe { self.2.LoadComputePipeline(&name, &self.desc(code)) }
+            }
+            fn serialized(&self) -> Vec<u8> {
+                // SAFETY: a buffer of the size asked for; nothing is stored
+                // meanwhile.
+                unsafe {
+                    let mut blob = vec![0; self.2.GetSerializedSize()];
+                    self.2.Serialize(&mut blob).unwrap();
+                    blob
+                }
+            }
+        }
+        let first = open(&device, Vec::new()).expect("an empty library");
+        let made = Shared(device.clone(), root.clone(), first.library.clone());
+        (0..N).for_each(|i| made.store(i, &codes[i]));
+        let again = open(&device, made.serialized()).expect("the library again");
+        let shared = Shared(device, root, again.library.clone());
+        let stores = Mutex::new(());
+        std::thread::scope(|s| {
+            for t in 0..8 {
+                let (shared, codes, stores) = (&shared, &codes, &stores);
+                s.spawn(move || {
+                    for i in (t..N).step_by(8) {
+                        shared.load(i, &codes[i]).expect("a stored pipeline");
+                        assert!(
+                            shared.load(i, &codes[(i + 1) % N]).is_err(),
+                            "another description"
+                        );
+                        assert!(shared.load(N + i, &codes[N + i]).is_err(), "not stored yet");
+                        let _one = stores.lock().unwrap();
+                        shared.store(N + i, &codes[N + i]);
+                        shared.serialized();
+                    }
+                });
+            }
+        });
+        for (i, code) in codes.iter().enumerate() {
+            shared.load(i, code).expect("every pipeline");
+        }
     }
 
     #[test]

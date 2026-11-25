@@ -15,10 +15,16 @@ pub struct KnownBuild {
     pub label: &'static str,
     /// BLAKE3 of the original executable, hex.
     pub blake3: &'static str,
+    /// RPF9 archive the title needs during startup, relative to its executable.
+    pub startup_archive: &'static str,
 }
 
-/// Builds we support. Empty until the executable is available.
-pub const KNOWN_BUILDS: &[KnownBuild] = &[];
+/// Executables identified from a local package.
+pub const KNOWN_BUILDS: &[KnownBuild] = &[KnownBuild {
+    label: "Series 1.0.2.1",
+    blake3: "b99f876b74d4a77f03af5f878223b27bd647b5c35a79d5decd9f716504239e93",
+    startup_archive: "appdata0.rpf",
+}];
 
 /// Looks up a build by the BLAKE3 hash of its executable.
 pub fn identify(blake3_hex: &str) -> Option<&'static KnownBuild> {
