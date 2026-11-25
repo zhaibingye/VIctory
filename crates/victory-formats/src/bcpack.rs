@@ -13,6 +13,7 @@
 //! kept in `bcpack-tables.bin` beside this file ([`Tables::builtin`]).
 
 use std::fmt;
+use std::mem::MaybeUninit;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Error(pub &'static str);
@@ -487,10 +488,22 @@ fn interleave(a: u8, b: u8) -> u8 {
 
 /// Block `i`'s reference `r`: 0 none, else `r` blocks back, before the first
 /// block into the dictionary.
-fn pick<'a, T>(i: usize, r: usize, history: &'a [T], dictionary: &'a [T], zero: &'a T) -> &'a T {
+fn pick<'a, T>(
+    i: usize,
+    r: usize,
+    history: &'a [MaybeUninit<T>; HISTORY],
+    dictionary: &'a [T],
+    zero: &'a T,
+) -> &'a T {
     match r {
         0 => zero,
-        r if r <= i => &history[(i - r) % HISTORY],
+        r if r <= i => {
+            // SAFETY: slot `(i - r) % HISTORY` was written by block `i - r`
+            // (its residue matches), and no later block has overwritten it:
+            // the next block with that residue is `i - r + HISTORY`, which is
+            // past block `i` because `r <= 255 < HISTORY`.
+            unsafe { history[(i - r) % HISTORY].assume_init_ref() }
+        }
         r => &dictionary[r - i - 1],
     }
 }
@@ -531,7 +544,7 @@ fn plain<'a>(
     residual: impl Fn(&[u8]) -> Plain,
     pack: fn(&Plain, &mut [u8]),
 ) -> Result<(), Error> {
-    let mut history = vec![Plain::default(); HISTORY];
+    let mut history = [MaybeUninit::<Plain>::uninit(); HISTORY];
     let zero = Plain::default();
     for (i, (s, block)) in records.zip(out).enumerate() {
         let (ep_ref, ix_ref) = references(s, w.paired);
@@ -544,7 +557,7 @@ fn plain<'a>(
         for ((v, r), bits) in v.ix.iter_mut().zip(ix_ref).zip(w.ix) {
             *v = v.wrapping_add(*r) & ((1u8 << bits) - 1);
         }
-        history[i % HISTORY] = v;
+        history[i % HISTORY].write(v);
         pack(&v, block);
     }
     Ok(())
@@ -759,7 +772,7 @@ fn bc7<'a>(
     out: impl Iterator<Item = &'a mut [u8]>,
     t: &Tables,
 ) -> Result<(), Error> {
-    let mut history = vec![(Bc7Ep::default(), Bc7Ix::default()); HISTORY];
+    let mut history = [MaybeUninit::<(Bc7Ep, Bc7Ix)>::uninit(); HISTORY];
     let zero = (Bc7Ep::default(), Bc7Ix::default());
     for (i, (s, block)) in records.zip(out).enumerate() {
         let (ep_ref, ix_ref) = references(s, true);
@@ -838,7 +851,7 @@ fn bc7<'a>(
                 }
             }
         }
-        history[i % HISTORY] = (ep, ix);
+        history[i % HISTORY].write((ep, ix));
         bc7_pack(&ep, &ix, prec, block);
     }
     Ok(())
@@ -1059,7 +1072,7 @@ fn bc6<'a>(
     out: impl Iterator<Item = &'a mut [u8]>,
     dictionary: &[(Bc6Ep, Bc6Ix)],
 ) -> Result<(), Error> {
-    let mut history = vec![(Bc6Ep::default(), Bc6Ix::default()); HISTORY];
+    let mut history = [MaybeUninit::<(Bc6Ep, Bc6Ix)>::uninit(); HISTORY];
     let zero = (
         Bc6Ep::default(),
         Bc6Ix {
@@ -1127,7 +1140,7 @@ fn bc6<'a>(
                 ix.ix[p] = add_index(v, bits, rx.ix[p], bc6_index_bits(rx.mode));
             }
         }
-        history[i % HISTORY] = (ep, ix);
+        history[i % HISTORY].write((ep, ix));
         // Fields: the working value has its top bit flipped.
         let field = |k: usize, c: usize| {
             let sh = if k == 0 { shift[0] } else { shift[1 + c] };
