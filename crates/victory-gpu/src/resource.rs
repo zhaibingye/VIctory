@@ -1116,8 +1116,11 @@ fn shared_texture(
     {
         SHARED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let Some(host) = crate::host::host() {
-            // SAFETY: a plain query on a host description (same layout).
-            let info = unsafe { host.device.GetResourceAllocationInfo(0, &[std::ptr::from_ref(&d).cast::<windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC>().read_unaligned()]) };
+            // The live texture's own description: `d` may ask for uses its
+            // format does not take on this host (unordered access on
+            // B5G5R5A1 on NVIDIA), which the query rejects by removing the
+            // device. SAFETY: plain queries on a live resource.
+            let info = unsafe { host.device.GetResourceAllocationInfo(0, &[t.texture.GetDesc()]) };
             SAVED.fetch_add(info.SizeInBytes, std::sync::atomic::Ordering::Relaxed);
         }
         return live;
