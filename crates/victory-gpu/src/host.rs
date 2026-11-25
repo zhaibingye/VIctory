@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WAIT_OBJECT_0, WPARAM};
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::{
     D3D_FEATURE_LEVEL_12_0, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, ID3DBlob,
@@ -596,6 +596,123 @@ mod tests {
         node.pCommandListDebugNameA = longer.as_ptr().cast();
         assert!(!list.is_node(&node), "a number that only starts with ours is no match");
     }
+
+    /// Submitting the same `HostList` twice in one `Host::execute` call must
+    /// split into separate `ExecuteCommandLists` batches separated by a fence
+    /// wait so neither the `prelude` allocator is clobbered nor the same direct
+    /// command list is submitted twice in a single `ExecuteCommandLists` call.
+    #[test]
+    fn duplicate_list_in_execute_uses_distinct_preludes() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let null = std::ptr::null();
+        let res_iid = crate::object::guid(
+            0x696442be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+        // 16x16 RGBA8 render target starting in COMMON (0).
+        let tex_desc: [u32; 14] = [
+            3, 0, // dimension=2D, pad
+            0, 0, // alignment=0
+            16, 0, // width=16
+            16,    // height=16
+            (1 << 16) | 1,
+            28, 1, 0, 0, 1, // RGBA8_UNORM, flags=ALLOW_RENDER_TARGET
+            0,
+        ];
+        let mut tex = null;
+        assert_eq!(
+            crate::resource::create_at_address(
+                null,
+                0x3_0000,
+                tex_desc.as_ptr().cast(),
+                0,
+                null.cast(),
+                &res_iid,
+                &mut tex,
+            ),
+            crate::object::S_OK
+        );
+        let list = host.new_list().unwrap();
+        // Record RENDER_TARGET (0x4) -> COPY_SOURCE (0x800) inside `list`.
+        assert!(list.transition(tex, 0x4).is_none());
+        let (host_tex, before) = list.transition(tex, 0x800).unwrap();
+        assert_eq!(before, 0x4);
+        // SAFETY: open list and live texture.
+        unsafe {
+            list.list.ResourceBarrier(&[transition(
+                host_tex,
+                D3D12_RESOURCE_STATES(0x4),
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+        }
+        list.close();
+
+        // Execute the SAME `HostList` twice in one submission:
+        //   Chunk 1 prelude: COMMON (0) -> RENDER_TARGET (0x4), list ends at COPY_SOURCE (0x800), fence wait.
+        //   Chunk 2 prelude: COPY_SOURCE (0x800) -> RENDER_TARGET (0x4), list ends at COPY_SOURCE (0x800), fence wait.
+        host.execute(&[&list, &list]);
+        assert_eq!(
+            crate::resource::host_copy(tex)
+                .unwrap()
+                .state
+                .load(Ordering::Relaxed),
+            0x800
+        );
+
+        // Distinct-list batching control: two distinct lists stay in one chunk.
+        let list2 = host.new_list().unwrap();
+        list2.close();
+        assert_eq!(unique_run_chunks(&[&list, &list2]).len(), 1);
+        assert_eq!(unique_run_chunks(&[&list, &list]).len(), 2);
+        host.execute(&[&list, &list2]);
+        // SAFETY: plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+
+        type Release = extern "system" fn(crate::object::This) -> u32;
+        crate::object::slot::<Release>(tex, 0x10)(tex);
+    }
+
+    #[test]
+    fn unique_run_chunks_preserves_distinct_batching_and_splits_repeats() {
+        let (a, b, c) = (1u8, 2u8, 3u8);
+        assert_eq!(unique_run_chunks::<u8>(&[]).len(), 0);
+        assert_eq!(unique_run_chunks(&[&a, &b, &c]).len(), 1);
+        let dup_in = [&a, &a];
+        let dup = unique_run_chunks(&dup_in);
+        assert_eq!(dup.len(), 2);
+        assert_eq!((dup[0].len(), dup[1].len()), (1, 1));
+        let mixed_in = [&a, &b, &a, &c, &b];
+        let mixed = unique_run_chunks(&mixed_in);
+        assert_eq!(mixed.len(), 2);
+        assert_eq!((mixed[0].len(), mixed[1].len()), (2, 3));
+    }
+}
+
+/// Partitions `runs` into maximal contiguous chunks in which no list pointer
+/// repeats. Distinct lists remain batched in one `ExecuteCommandLists` call,
+/// while a repeated list waits on the GPU fence before its prelude allocator is
+/// reset and its body is resubmitted.
+fn unique_run_chunks<'a, T>(runs: &'a [&'a T]) -> Vec<&'a [&'a T]> {
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    let mut seen: Vec<usize> = Vec::with_capacity(runs.len());
+    for (i, item) in runs.iter().enumerate() {
+        let id = std::ptr::from_ref(*item) as usize;
+        if seen.contains(&id) {
+            chunks.push(&runs[start..i]);
+            start = i;
+            seen.clear();
+        }
+        seen.push(id);
+    }
+    if start < runs.len() {
+        chunks.push(&runs[start..]);
+    }
+    chunks
 }
 
 /// A host command list and its allocator, always used together.
@@ -976,7 +1093,7 @@ impl Host {
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
-        let faults = crate::copystat::page_faults();
+        let mut faults = crate::copystat::page_faults();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
         // Descriptors the title copied into its heaps itself, before the
@@ -1030,78 +1147,130 @@ impl Host {
                 }
             }
         }
+        // Split only when a `HostList` repeats so distinct lists stay batched in
+        // a single `ExecuteCommandLists` call, while a repeated direct list
+        // waits on the GPU fence before its prelude allocator is reset and its
+        // body is resubmitted (per D3D12 ExecuteCommandLists ordering rules).
+        let chunks = unique_run_chunks(runs);
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
-        let mut batch = Batch::default();
-        for list in runs {
-            list.run_deferred(&mut batch);
-            firsts.push(lists.len());
-            #[cfg(feature = "diagnostics")]
-            let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::PreludeUs);
-            if let Some(prelude) = list.prelude() {
-                lists.push(Some(prelude));
-            }
-            lists.push(list.list.cast().ok());
-        }
-        batch.flush();
-        let prepared = std::time::Instant::now();
-        #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::FaultsPrep, crate::copystat::page_faults().saturating_sub(faults));
-        // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
-        #[cfg(feature = "diagnostics")]
-        let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
-            firsts
-                .iter()
-                .zip(firsts.iter().skip(1).chain([&lists.len()]))
-                .map(|(&a, &b)| &lists[a..b])
-                .collect()
-        } else {
-            vec![&lists[..]]
-        };
-        #[cfg(not(feature = "diagnostics"))]
-        let groups = [&lists[..]];
+        let mut prep_us = started.elapsed().as_micros() as u64;
+        let mut gpu = std::time::Duration::ZERO;
         let mut removed_in = None;
-        for (i, group) in groups.iter().enumerate() {
-            *submitted += 1;
-            let started = std::time::Instant::now();
+        let multiple_chunks = chunks.len() > 1;
+        let mut chunk_base = 0usize;
+        for chunk in chunks {
+            let chunk_start = std::time::Instant::now();
+            lists.clear();
+            firsts.clear();
+            let mut batch = Batch::default();
+            for list in chunk {
+                list.run_deferred(&mut batch);
+                firsts.push(lists.len());
+                #[cfg(feature = "diagnostics")]
+                let _timed =
+                    crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::PreludeUs);
+                if let Some(prelude) = list.prelude() {
+                    lists.push(Some(prelude));
+                }
+                lists.push(list.list.cast().ok());
+            }
+            batch.flush();
+            let prepared = std::time::Instant::now();
+            prep_us += (prepared - chunk_start).as_micros() as u64;
             #[cfg(feature = "diagnostics")]
-            crate::resource::life::note(0, crate::resource::life::SUBMITTED, *submitted, 0);
-            // SAFETY: closed lists; the fence and event are ours.
-            unsafe {
-                self.queue.ExecuteCommandLists(group);
-                let waited = self
-                    .queue
-                    .Signal(&self.fence, *submitted)
-                    .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
-                match waited {
-                    Ok(()) => {
-                        WaitForSingleObject(self.event, INFINITE);
+            crate::copystat::add(
+                crate::copystat::C::FaultsPrep,
+                crate::copystat::page_faults().saturating_sub(faults),
+            );
+            // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
+            #[cfg(feature = "diagnostics")]
+            let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
+                firsts
+                    .iter()
+                    .zip(firsts.iter().skip(1).chain([&lists.len()]))
+                    .map(|(&a, &b)| &lists[a..b])
+                    .collect()
+            } else {
+                vec![&lists[..]]
+            };
+            #[cfg(not(feature = "diagnostics"))]
+            let groups = [&lists[..]];
+            for (i, group) in groups.iter().enumerate() {
+                *submitted += 1;
+                let group_started = std::time::Instant::now();
+                #[cfg(feature = "diagnostics")]
+                crate::resource::life::note(0, crate::resource::life::SUBMITTED, *submitted, 0);
+                // SAFETY: closed lists; the fence and event are ours.
+                unsafe {
+                    self.queue.ExecuteCommandLists(group);
+                    let waited = self
+                        .queue
+                        .Signal(&self.fence, *submitted)
+                        .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
+                    let waited = waited.and_then(|()| {
+                        if WaitForSingleObject(self.event, INFINITE) == WAIT_OBJECT_0 {
+                            Ok(())
+                        } else {
+                            Err(windows::core::Error::from_thread())
+                        }
+                    });
+                    if let Err(e) = waited {
+                        // The next chunk can reset this allocator. Never
+                        // proceed if the preceding fence did not complete.
+                        fail(format_args!(
+                            "host submission fence wait failed: {e}{}",
+                            self.removal_data(runs)
+                        ));
                     }
-                    Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
+                }
+                #[cfg(feature = "diagnostics")]
+                crate::resource::life::note(0, crate::resource::life::RAN, *submitted, 0);
+                #[cfg(feature = "diagnostics")]
+                if groups.len() > 1 && group_started.elapsed() > std::time::Duration::from_millis(50)
+                {
+                    // SAFETY: a plain query.
+                    let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
+                    let run_idx = chunk_base + i;
+                    let commands = runs[run_idx]
+                        .notes
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .len();
+                    tracing::warn!(
+                        ms = group_started.elapsed().as_millis(),
+                        commands,
+                        "slow host list"
+                    );
+                    for (ms, op) in runs[run_idx].slowest(frequency, 6) {
+                        tracing::warn!("slow list command, {ms:.1} ms: {op}");
+                    }
+                }
+                if groups.len() > 1 && removed_in.is_none() {
+                    // SAFETY: a plain query.
+                    if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
+                        removed_in = Some(chunk_base + i);
+                    }
+                }
+                let _ = (i, group_started);
+            }
+            gpu += prepared.elapsed();
+            chunk_base += chunk.len();
+            if multiple_chunks && chunk_base < runs.len() {
+                // Do not prepare another list on a removed device.
+                // SAFETY: a plain query, after the fence wait.
+                if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
+                    break;
+                }
+                #[cfg(feature = "diagnostics")]
+                {
+                    faults = crate::copystat::page_faults();
                 }
             }
-            #[cfg(feature = "diagnostics")]
-            crate::resource::life::note(0, crate::resource::life::RAN, *submitted, 0);
-            #[cfg(feature = "diagnostics")]
-            if groups.len() > 1 && started.elapsed() > std::time::Duration::from_millis(50) {
-                // SAFETY: a plain query.
-                let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
-                let commands = runs[i].notes.lock().unwrap_or_else(|e| e.into_inner()).len();
-                tracing::warn!(ms = started.elapsed().as_millis(), commands, "slow host list");
-                for (ms, op) in runs[i].slowest(frequency, 6) {
-                    tracing::warn!("slow list command, {ms:.1} ms: {op}");
-                }
-            }
-            // SAFETY: a plain query.
-            if groups.len() > 1 && removed_in.is_none() && unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
-                removed_in = Some(i);
-            }
-            let _ = (i, started);
         }
         let _ = &firsts;
-        let gpu = prepared.elapsed();
-        SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
+        SUBMISSION_US[0].fetch_add(prep_us, Ordering::Relaxed);
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
         // The host resets a device whose submission runs for about 2 s.
         if gpu > std::time::Duration::from_millis(250) {
@@ -1189,7 +1358,6 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         if traced {
             let sub = *submitted;
-            drop(submitted);
             let mut targets: Vec<(usize, String)> = Vec::new();
             for r in runs {
                 for t in r.targets.lock().unwrap_or_else(|e| e.into_inner()).iter() {
@@ -1198,6 +1366,9 @@ impl Host {
                     }
                 }
             }
+            // The capture can submit work that takes both locks.
+            drop(uploads);
+            drop(submitted);
             crate::capture::dump_submission(sub, &targets);
         }
     }
