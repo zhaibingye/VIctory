@@ -886,11 +886,31 @@ extern "system" fn set_pipeline(this: This, pipeline: This) {
     let _ = this;
 }
 
+/// Records a global UAV barrier on `this`'s host list so earlier shader
+/// writes finish before later GPU work starts.
+fn wait_for_shader_writes(this: This) {
+    #[cfg(windows)]
+    if let Some(list) = host_list(this) {
+        use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
+        // SAFETY: `Barrier` matches `D3D12_RESOURCE_BARRIER` in layout, and
+        // `UAV_BARRIER` names no resource (`first` is null).
+        let barrier =
+            unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
+        // SAFETY: `list.list` is an open host command list.
+        unsafe { list.list.ResourceBarrier(&[barrier]) };
+    }
+    #[cfg(not(windows))]
+    let _ = this;
+}
+
 /// Pipeline syncs: waits for earlier work and cache flushes, at the top or
-/// bottom of the pipe `(flags, control, address, size)`. Host lists order
-/// their own work and every submission is waited for, so there is nothing
-/// to do.
-extern "system" fn sync(_: This, _flags: u32, _control: u32, _address: u64, _size: u64) {}
+/// bottom of the pipe `(flags, control, address, size)`. Within a single
+/// command list, earlier shader writes must finish before later dispatches
+/// or draws read or write the same resources, so record a UAV barrier on
+/// the host list.
+extern "system" fn sync(this: This, _flags: u32, _control: u32, _address: u64, _size: u64) {
+    wait_for_shader_writes(this);
+}
 
 /// Reset with console flags `(allocator, pipeline, flags)`; the flags only
 /// tune the console's command memory.
@@ -1372,18 +1392,9 @@ extern "system" fn wait_value(_: This, _address: u64, _comparison: u32, _referen
 /// first, so only their ordering matters: one barrier on every shader
 /// write (the title's buffer barriers order compute passes).
 extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
-    #[cfg(windows)]
-    if count > 0
-        && let Some(list) = host_list(this)
-    {
-        use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
-        // SAFETY: the same layout; no resource named.
-        let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
-        // SAFETY: an open list.
-        unsafe { list.list.ResourceBarrier(&[barrier]) };
+    if count > 0 {
+        wait_for_shader_writes(this);
     }
-    #[cfg(not(windows))]
-    let _ = (this, count);
 }
 
 /// The bottom-of-pipe value writes `(address, value, flush, flags)`, 32 and
@@ -1722,5 +1733,347 @@ mod tests {
         for object in [buffer, list, allocator] {
             assert_eq!(release(object), 0);
         }
+    }
+
+    fn non_host_list(newer: bool) -> This {
+        let table = if newer {
+            &NEWER_LIST_FUNCTIONS
+        } else {
+            &LIST_FUNCTIONS
+        };
+        Box::into_raw(Box::new(List {
+            object: Object::new(table),
+            kind: 0,
+            put: [0; 5],
+            reserved: [0; 64],
+            graphics_root_headers: [0; 128],
+            compute_root_headers: [0; 128],
+            pipeline_shadow: [0; 8],
+            newer: [0; 256],
+            uploads: Default::default(),
+            #[cfg(windows)]
+            host: None,
+            #[cfg(windows)]
+            state: Default::default(),
+        }))
+        .cast()
+    }
+
+    #[test]
+    fn sync_is_safe_on_null_and_non_host_lists() {
+        type SyncFn = extern "system" fn(This, u32, u32, u64, u64);
+        type BarrierGroupsFn = extern "system" fn(This, u32, *const u8);
+
+        let base = list_table(false);
+        assert_eq!(base[129], sync as *const ());
+        assert_eq!(base[130], sync as *const ());
+        let newer = list_table(true);
+        assert_eq!(newer[131], sync as *const ());
+        assert_eq!(newer[132], sync as *const ());
+        assert_eq!(newer[146], barrier_groups as *const ());
+
+        sync(std::ptr::null(), 1, 2, 0x1000, 64);
+        barrier_groups(std::ptr::null(), 1, std::ptr::null());
+
+        for (is_newer, slots) in [(false, [129usize, 130]), (true, [131usize, 132])] {
+            let list = non_host_list(is_newer);
+            for slot_index in slots {
+                let offset = slot_index * size_of::<*const ()>();
+                slot::<SyncFn>(list, offset)(list, 0, 0, 0, 0);
+                slot::<SyncFn>(list, offset)(list, 0x3, 0x1, 0xdead_beef, 256);
+            }
+            if is_newer {
+                let offset = 146 * size_of::<*const ()>();
+                slot::<BarrierGroupsFn>(list, offset)(list, 0, std::ptr::null());
+                slot::<BarrierGroupsFn>(list, offset)(list, 2, std::ptr::null());
+            }
+            assert_eq!(slot::<extern "system" fn(This) -> u32>(list, 0x10)(list), 0);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sync_orders_dependent_compute_uav_dispatches() {
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D_ROOT_SIGNATURE_VERSION_1_0, D3D12_COMPUTE_PIPELINE_STATE_DESC,
+            D3D12_ROOT_CONSTANTS, D3D12_ROOT_DESCRIPTOR, D3D12_ROOT_PARAMETER,
+            D3D12_ROOT_PARAMETER_0, D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+            D3D12_ROOT_PARAMETER_TYPE_UAV, D3D12_ROOT_SIGNATURE_DESC,
+            D3D12_ROOT_SIGNATURE_FLAG_NONE, D3D12_SHADER_BYTECODE, D3D12_SHADER_VISIBILITY_ALL,
+            D3D12SerializeRootSignature, ID3D12PipelineState, ID3D12RootSignature,
+        };
+        use windows::core::s;
+
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+
+        const SOURCE: &str = r#"
+cbuffer Params : register(b0) { uint count; uint stage; };
+RWStructuredBuffer<uint> buf_a : register(u0);
+RWStructuredBuffer<uint> buf_b : register(u1);
+[numthreads(64, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= count) return;
+    if (stage == 0u) {
+        uint v = id.x ^ 0xA5A50001u;
+        for (uint k = 0u; k < 32u; ++k) {
+            v = v * 1664525u + 1013904223u;
+        }
+        buf_a[id.x] = v;
+    } else if (stage == 1u) {
+        uint rev = count - 1u - id.x;
+        uint v = buf_a[rev];
+        buf_b[id.x] = v + 1u;
+    } else if (stage == 2u) {
+        uint rev = count - 1u - id.x;
+        uint v = buf_b[rev];
+        buf_a[id.x] = v * 3u;
+    } else {
+        uint rev = count - 1u - id.x;
+        uint v = buf_a[rev];
+        buf_b[id.x] = v ^ 0x55AA55AAu;
+    }
+}
+"#;
+
+        let mut code: Option<ID3DBlob> = None;
+        let mut errors: Option<ID3DBlob> = None;
+        // SAFETY: valid static HLSL source and entry-point/target names.
+        let compiled = unsafe {
+            D3DCompile(
+                SOURCE.as_ptr().cast(),
+                SOURCE.len(),
+                s!("sync_ordering_test"),
+                None,
+                None,
+                s!("main"),
+                s!("cs_5_1"),
+                0,
+                0,
+                &mut code,
+                Some(&mut errors),
+            )
+        };
+        if let Err(e) = compiled {
+            let msg = errors
+                .map(|b| {
+                    // SAFETY: the compiler error blob owns its bytes.
+                    let slice = unsafe {
+                        std::slice::from_raw_parts(
+                            b.GetBufferPointer().cast::<u8>(),
+                            b.GetBufferSize(),
+                        )
+                    };
+                    String::from_utf8_lossy(slice).into_owned()
+                })
+                .unwrap_or_default();
+            panic!("D3DCompile failed ({e}): {msg}");
+        }
+        let code = code.expect("compiled shader blob");
+
+        let params = [
+            D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+                Anonymous: D3D12_ROOT_PARAMETER_0 {
+                    Constants: D3D12_ROOT_CONSTANTS {
+                        ShaderRegister: 0,
+                        RegisterSpace: 0,
+                        Num32BitValues: 2,
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            },
+            D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
+                Anonymous: D3D12_ROOT_PARAMETER_0 {
+                    Descriptor: D3D12_ROOT_DESCRIPTOR {
+                        ShaderRegister: 0,
+                        RegisterSpace: 0,
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            },
+            D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
+                Anonymous: D3D12_ROOT_PARAMETER_0 {
+                    Descriptor: D3D12_ROOT_DESCRIPTOR {
+                        ShaderRegister: 1,
+                        RegisterSpace: 0,
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            },
+        ];
+        let rs_desc = D3D12_ROOT_SIGNATURE_DESC {
+            NumParameters: params.len() as u32,
+            pParameters: params.as_ptr(),
+            NumStaticSamplers: 0,
+            pStaticSamplers: std::ptr::null(),
+            Flags: D3D12_ROOT_SIGNATURE_FLAG_NONE,
+        };
+        let mut rs_blob: Option<ID3DBlob> = None;
+        let mut rs_errors: Option<ID3DBlob> = None;
+        // SAFETY: `rs_desc` points to valid `params` array for the duration of the call.
+        unsafe {
+            D3D12SerializeRootSignature(
+                &rs_desc,
+                D3D_ROOT_SIGNATURE_VERSION_1_0,
+                &mut rs_blob,
+                Some(&mut rs_errors),
+            )
+            .expect("serialize root signature");
+        }
+        let rs_blob = rs_blob.expect("root signature blob");
+
+        // SAFETY: `rs_blob` and `code` own valid serialized root signature and DXBC bytes.
+        let (root, pso): (ID3D12RootSignature, ID3D12PipelineState) = unsafe {
+            let rs_bytes = std::slice::from_raw_parts(
+                rs_blob.GetBufferPointer().cast::<u8>(),
+                rs_blob.GetBufferSize(),
+            );
+            let bytes = std::slice::from_raw_parts(
+                code.GetBufferPointer().cast::<u8>(),
+                code.GetBufferSize(),
+            );
+            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, rs_bytes).unwrap();
+            let pso = host
+                .device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: bytes.as_ptr().cast(),
+                        BytecodeLength: bytes.len(),
+                    },
+                    ..Default::default()
+                })
+                .unwrap();
+            (root, pso)
+        };
+
+        const COUNT: u32 = 65_536;
+        const GROUPS: u32 = COUNT / 64;
+        let bytes = u64::from(COUNT) * 4;
+        let (buf_a, ptr_a) = host.shared_buffer(bytes).expect("shared buffer A");
+        let (buf_b, ptr_b) = host.shared_buffer(bytes).expect("shared buffer B");
+        // SAFETY: `ptr_a` and `ptr_b` point to `bytes` mapped bytes each.
+        unsafe {
+            ptr_a.write_bytes(0, bytes as usize);
+            ptr_b.write_bytes(0, bytes as usize);
+        }
+        // SAFETY: live D3D12 buffer resources.
+        let (gpu_a, gpu_b) =
+            unsafe { (buf_a.GetGPUVirtualAddress(), buf_b.GetGPUVirtualAddress()) };
+
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let mut list = null;
+        assert_eq!(
+            create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+            S_OK
+        );
+        let hl = host_list(list).expect("host list present when host GPU exists");
+
+        // `device::tests::newer_device_levels_are_the_same_device` may flip
+        // `device::newer()` in parallel, so inspect this list's own vtable.
+        // SAFETY: `list` starts with `Object` whose first pointer is its vtable.
+        let is_newer = unsafe {
+            std::ptr::eq(
+                *list.cast::<*const *const ()>(),
+                NEWER_LIST_FUNCTIONS.0.as_ptr(),
+            )
+        };
+        let (top_slot, bottom_slot) = if is_newer {
+            (newer_slot(129), newer_slot(130))
+        } else {
+            (129, 130)
+        };
+
+        type SyncFn = extern "system" fn(This, u32, u32, u64, u64);
+        let sync_top = slot::<SyncFn>(list, top_slot * size_of::<*const ()>());
+        let sync_bottom = slot::<SyncFn>(list, bottom_slot * size_of::<*const ()>());
+
+        // SAFETY: `hl.list` is an open list and `root`, `pso`, `buf_a`, `buf_b` outlive execution.
+        unsafe {
+            hl.list.SetComputeRootSignature(&root);
+            hl.list.SetPipelineState(&pso);
+            hl.list.SetComputeRootUnorderedAccessView(1, gpu_a);
+            hl.list.SetComputeRootUnorderedAccessView(2, gpu_b);
+
+            let p0 = [COUNT, 0u32];
+            hl.list
+                .SetComputeRoot32BitConstants(0, 2, p0.as_ptr().cast(), 0);
+            hl.list.Dispatch(GROUPS, 1, 1);
+
+            sync_top(list, 0, 0, 0, 0);
+
+            let p1 = [COUNT, 1u32];
+            hl.list
+                .SetComputeRoot32BitConstants(0, 2, p1.as_ptr().cast(), 0);
+            hl.list.Dispatch(GROUPS, 1, 1);
+
+            sync_bottom(list, 0x1, 0x2, 0x1000, 64);
+
+            let p2 = [COUNT, 2u32];
+            hl.list
+                .SetComputeRoot32BitConstants(0, 2, p2.as_ptr().cast(), 0);
+            hl.list.Dispatch(GROUPS, 1, 1);
+
+            // `count == 0` is a no-op; `count > 0` orders pass 3 after pass 2.
+            barrier_groups(list, 0, std::ptr::null());
+            barrier_groups(list, 1, std::ptr::null());
+
+            let p3 = [COUNT, 3u32];
+            hl.list
+                .SetComputeRoot32BitConstants(0, 2, p3.as_ptr().cast(), 0);
+            hl.list.Dispatch(GROUPS, 1, 1);
+        }
+
+        assert_eq!(
+            slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list),
+            S_OK
+        );
+        host.execute(&[hl]);
+
+        // SAFETY: `host.execute` waited for GPU completion; both mappings cover `COUNT` u32s.
+        let (out_a, out_b) = unsafe {
+            (
+                std::slice::from_raw_parts(ptr_a.cast::<u32>(), COUNT as usize),
+                std::slice::from_raw_parts(ptr_b.cast::<u32>(), COUNT as usize),
+            )
+        };
+        for i in 0..COUNT {
+            let mut v = i ^ 0xA5A5_0001;
+            for _ in 0..32 {
+                v = v.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            }
+            let expected_a = v.wrapping_add(1).wrapping_mul(3);
+            assert_eq!(
+                out_a[i as usize], expected_a,
+                "ordering mismatch in buf_a at {i}"
+            );
+
+            let rev = COUNT - 1 - i;
+            let mut v_rev = rev ^ 0xA5A5_0001;
+            for _ in 0..32 {
+                v_rev = v_rev.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            }
+            let expected_b = v_rev.wrapping_add(1).wrapping_mul(3) ^ 0x55AA_55AA;
+            assert_eq!(
+                out_b[i as usize], expected_b,
+                "ordering mismatch in buf_b at {i}"
+            );
+        }
+
+        assert_eq!(reset(list, allocator, null), S_OK);
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
     }
 }
