@@ -14,9 +14,14 @@ use crate::{io, ir, range, resource, structure};
 
 const S_ENDPGM: u32 = 0xBF81_0000;
 
+/// SOP1 `op sdst, src0`.
+const fn sop1(op: u8, sdst: u8, src0: u8) -> u32 {
+    0xBE80_0000 | (sdst as u32) << 16 | (op as u32) << 8 | src0 as u32
+}
+
 /// SOP1 `s_mov_b32 sdst, src0`.
 const fn s_mov_b32(sdst: u8, src0: u8) -> u32 {
-    0xBE80_0000 | (sdst as u32) << 16 | 0x03 << 8 | src0 as u32
+    sop1(0x03, sdst, src0)
 }
 
 /// SOP2 `op sdst, src0, src1`.
@@ -223,6 +228,79 @@ fn run_cases(
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+#[test]
+fn scalar_ff0_reads_the_source_width_and_writes_only_one_sgpr() {
+    use ir::Reg::S;
+
+    for (opcode, name, reads) in [
+        (0x11, "s_ff0_i32_b32", &[S(0)][..]),
+        (0x12, "s_ff0_i32_b64", &[S(0), S(1)][..]),
+    ] {
+        let code = [sop1(opcode, 16, 0), S_ENDPGM]
+            .map(u32::to_le_bytes)
+            .concat();
+        let program = ir::build(&code, false, 16).unwrap();
+        let inst = &program.blocks[0].insts[0];
+        assert_eq!(inst.name(), name);
+        assert!(
+            inst.reads
+                .iter()
+                .map(|&(reg, _)| reg)
+                .eq(reads.iter().copied())
+        );
+        assert!(inst.writes.iter().map(|&(reg, _)| reg).eq([S(16)]));
+    }
+}
+
+#[test]
+fn scalar_ff0_finds_the_lowest_clear_bit_and_preserves_scc() {
+    let cases32 = [
+        (0, 0, 0),
+        (1, 0, 1),
+        (0x0000_FFFF, 0, 16),
+        (0x7FFF_FFFF, 0, 31),
+        (u32::MAX, 0, u32::MAX),
+    ];
+    let cases64 = [
+        (0, 0, 0),
+        (0x0000_FFFF, 0, 16),
+        (u32::MAX, 0, 32),
+        (u32::MAX, 0x0000_FFFF, 48),
+        (u32::MAX, 0x7FFF_FFFF, 63),
+        (u32::MAX, u32::MAX, u32::MAX),
+    ];
+    for (opcode, cases) in [(0x11, &cases32[..]), (0x12, &cases64[..])] {
+        // Toggle the result's top bit when SCC is set to check both in one dword.
+        let shader = build_valu_cs(&[
+            0xBF06_8102,              // s_cmp_eq_u32 s2, 1
+            sop1(opcode, 16, 0),      // s_ff0 s16, s0 (s[0:1] for b64)
+            sop2(0x0a, 18, 255, 128), // s_cselect_b32 s18, 0x80000000, 0
+            0x8000_0000,
+            sop2(0x12, 16, 16, 18), // s_xor_b32 s16, s16, s18
+            vop1(1, 0, sgpr(16)),   // v_mov_b32 v0, s16
+        ]);
+        let container = crate::Container::parse(&shader.dxil).unwrap();
+        let features = container.part(crate::FourCC::SFI0).unwrap();
+        assert_eq!(
+            u64::from_le_bytes(features.data.try_into().unwrap()) & 0x8000,
+            0,
+            "opcode {opcode:#x} requires Int64"
+        );
+
+        let inputs: Vec<_> = cases
+            .iter()
+            .flat_map(|&(lo, hi, _)| [[lo, hi, 0, 0], [lo, hi, 1, 0]])
+            .collect();
+        run_cases(&shader, &inputs, |backend, i, [lo, hi, scc, _], got| {
+            let expected = cases[i / 2].2 ^ (scc << 31);
+            assert_eq!(
+                got, expected,
+                "{backend}, opcode {opcode:#x}, input {hi:08x}:{lo:08x}, SCC {scc}"
+            );
+        });
+    }
 }
 
 #[test]
