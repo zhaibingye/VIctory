@@ -187,7 +187,7 @@ fn version_number(file: &str) -> Option<u64> {
 }
 
 /// The names in version folder `dir`: container, display, blobs; `None` if
-/// its manifest is missing or does not parse.
+/// its manifest is missing, malformed, or refers to a missing or non-file blob.
 fn load(dir: &Path) -> std::io::Result<Option<(String, String, Vec<String>)>> {
     let bytes = match std::fs::read(dir.join(MANIFEST)) {
         Ok(bytes) => bytes,
@@ -198,6 +198,15 @@ fn load(dir: &Path) -> std::io::Result<Option<(String, String, Vec<String>)>> {
         return Ok(None);
     };
     let blobs = names.split_off(2);
+    // Older versions may be pruned as soon as this one is selected.
+    for i in 0..blobs.len() {
+        match std::fs::metadata(dir.join(i.to_string())) {
+            Ok(meta) if meta.is_file() => {}
+            Ok(_) => return Ok(None),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        }
+    }
     let [name, display] = <[String; 2]>::try_from(names).expect("two names, checked by the parser");
     Ok(Some((name, display, blobs)))
 }
@@ -244,7 +253,7 @@ fn current(dir: &Path) -> std::io::Result<Option<Version>> {
     // Versions exist but none reads: keep them all, and refuse.
     Err(std::io::Error::new(
         std::io::ErrorKind::InvalidData,
-        "no save version has a readable manifest",
+        "no complete save version",
     ))
 }
 
@@ -1446,12 +1455,21 @@ mod tests {
     #[test]
     fn an_unreadable_newer_version_does_not_cost_the_save() {
         type Make = fn(&Path);
-        let strays: [(&str, Make); 3] = [
+        let strays: [(&str, Make); 5] = [
             ("empty folder", |p| std::fs::create_dir(p).unwrap()),
             ("file", |p| std::fs::write(p, b"not a version").unwrap()),
             ("broken manifest", |p| {
                 std::fs::create_dir(p).unwrap();
                 std::fs::write(p.join(MANIFEST), [9, 0, 0, 0, b'x']).unwrap();
+            }),
+            ("missing second blob", |p| {
+                std::fs::create_dir(p).unwrap();
+                std::fs::write(p.join(MANIFEST), manifest("Slot", "partial", &["a", "b"])).unwrap();
+                std::fs::write(p.join("0"), b"partial a").unwrap();
+            }),
+            ("directory in place of blob", |p| {
+                std::fs::create_dir_all(p.join("0")).unwrap();
+                std::fs::write(p.join(MANIFEST), manifest("Slot", "partial", &["a"])).unwrap();
             }),
         ];
         for (what, make) in strays {
@@ -1461,8 +1479,11 @@ mod tests {
             let slot = container_dir(root, "Slot");
             make(&slot.join("v2"));
 
+            let c = Provider { root: root.into() }.container("Slot");
+            let result = read(&c, None);
+            assert!(slot.join("v1").is_dir(), "{what}: v1 was removed; read returned {result:?}");
             assert_eq!(state(root), old_state(), "{what}: read");
-            assert!(slot.join("v1").is_dir(), "{what}: v1 was removed");
+            assert!(result.is_ok(), "{what}: first read failed");
 
             assert_eq!(update(root, "two", &[("a", Some("new a"))]), S_OK, "{what}: update");
             let blobs = vec![("a".into(), "new a".into()), ("b".into(), "old b".into())];
@@ -1488,5 +1509,38 @@ mod tests {
         assert_eq!(update(root, "two", &[("a", Some("new a"))]), NO_ACCESS);
         assert!(slot.join("v1").join("0").is_file());
         assert!(!slot.join("v2").exists());
+    }
+
+    #[test]
+    fn incomplete_versions_survive_failed_reads_and_updates() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let c = Provider { root: root.into() }.container("Slot");
+        let bytes = manifest("Slot", "partial", &["a", "b"]);
+        for version in ["v1", "v2"] {
+            let path = c.dir.join(version);
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(path.join(MANIFEST), &bytes).unwrap();
+            std::fs::write(path.join("0"), version).unwrap();
+        }
+        let result = read(&c, None);
+        assert!(c.dir.join("v1").is_dir(), "read removed v1: {result:?}");
+        assert_eq!(result.err(), Some(NO_ACCESS));
+        assert_eq!(update(root, "next", &[("b", Some("replacement"))]), NO_ACCESS);
+        for version in ["v1", "v2"] {
+            let path = c.dir.join(version);
+            assert_eq!(std::fs::read(path.join(MANIFEST)).unwrap(), bytes);
+            assert_eq!(std::fs::read(path.join("0")).unwrap(), version.as_bytes());
+        }
+        assert!(!c.dir.join("v3").exists());
+    }
+
+    #[test]
+    fn a_present_empty_blob_is_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert_eq!(update(root, "one", &[("a", Some("old"))]), S_OK);
+        assert_eq!(update(root, "two", &[("a", Some(""))]), S_OK);
+        assert_eq!(state(root), Some(("two".into(), vec![("a".into(), "".into())])));
     }
 }
