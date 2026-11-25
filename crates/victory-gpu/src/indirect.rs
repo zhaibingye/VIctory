@@ -33,11 +33,8 @@ RWByteAddressBuffer budget : register(u1);
 static const uint BUDGET = 1u << 27;
 // Groups of one dispatch; more run empty.
 static const uint GROUPS = 1u << 20;
-[RootSignature(RS)]
-[numthreads(64, 1, 1)]
-void main(uint3 id : SV_DispatchThreadID) {
-    if (id.x >= records) return;
-    uint at = id.x * stride;
+// Clamps the record at `at` in place; its cost.
+uint clamped(uint at) {
     uint cost;
     if (kind <= 1) {
         // Draws: vertex or index count, then instances.
@@ -60,11 +57,51 @@ void main(uint3 id : SV_DispatchThreadID) {
         cost = g.x * g.y * g.z * 128;
         args.Store3(at, g);
     }
-    uint before;
-    budget.InterlockedAdd(0, cost, before);
-    if (before >= BUDGET || before + cost > BUDGET) {
-        // Draws keep their layout with no vertices; groups become zero.
-        args.Store(at, 0);
+    return cost;
+}
+// A record past the budget (no cost reaches it).
+static const uint PAST = 0xffffffffu;
+groupshared uint costs[64];
+// One group walks the records in tiles of 64: every lane clamps its own
+// record, then the first lane charges the tile's records in order. No
+// other group shares the budget: a shared add wraps once enough records
+// are rejected, and a compare-exchange retries more the more records fit.
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint lane : SV_GroupIndex) {
+    uint left = 0;
+    if (lane == 0) {
+        left = BUDGET - min(budget.Load(0), BUDGET);
+    }
+    for (uint tile = 0; tile < records / 64 + min(records % 64, 1u); tile++) {
+        uint record = tile * 64 + lane;
+        uint at = record * stride;
+        uint cost = 0;
+        if (record < records) {
+            cost = clamped(at);
+        }
+        costs[lane] = cost;
+        GroupMemoryBarrierWithGroupSync();
+        if (lane == 0) {
+            for (uint i = 0; i < 64; i++) {
+                if (costs[i] > left) {
+                    // The first record that does not fit takes what is
+                    // left, so those after it run empty too.
+                    costs[i] = PAST;
+                    left = 0;
+                } else {
+                    left -= costs[i];
+                }
+            }
+        }
+        GroupMemoryBarrierWithGroupSync();
+        if (costs[lane] == PAST) {
+            // Draws keep their layout with no vertices; groups become zero.
+            args.Store(at, 0);
+        }
+    }
+    if (lane == 0) {
+        budget.Store(0, BUDGET - left);
     }
 }
 "#;
@@ -168,7 +205,8 @@ pub(crate) fn bound(
         l.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
         l.SetComputeRootUnorderedAccessView(1, gpu);
         l.SetComputeRootUnorderedAccessView(2, budget);
-        l.Dispatch(records.div_ceil(64), 1, 1);
+        // One group walks every record.
+        l.Dispatch(records.min(1), 1, 1);
         l.ResourceBarrier(&[
             uav_barrier(),
             transition(
@@ -213,5 +251,94 @@ mod tests {
             return; // no host GPU here
         }
         assert!(super::clamp().is_some());
+    }
+
+    /// Clamps `records` records of `kind`, filled by repeating `words`,
+    /// `calls` times in one list: each record's first word after (zero when
+    /// it runs empty). One record more follows them and must stay as
+    /// written. `None` without a host GPU.
+    fn clamped(kind: u32, words: &[u32], records: u32, calls: u32) -> Option<Vec<u32>> {
+        let host = super::host()?;
+        // Words in a record of `kind`.
+        let per = match kind {
+            0 => 4,
+            1 => 5,
+            _ => 3,
+        };
+        let spec = (kind, per as u32 * 4, records);
+        let all = per * (records as usize + 1);
+        let (buffer, data) = host.shared_buffer(all as u64 * 4).unwrap();
+        let data = data.cast::<u32>();
+        let list = host.new_list().unwrap();
+        // SAFETY: our mapped buffer, written before the list runs and read
+        // after it has; a live buffer.
+        unsafe {
+            for at in 0..all {
+                data.add(at).write_volatile(words[at % words.len()]);
+            }
+            let gpu = buffer.GetGPUVirtualAddress();
+            for _ in 0..calls {
+                assert!(super::bound(&list, &buffer, gpu, spec));
+                super::done(&list, &buffer);
+            }
+            list.close();
+            host.execute(&[&list]);
+            for at in all - per..all {
+                assert_eq!(data.add(at).read_volatile(), words[at % words.len()]);
+            }
+            let first = |i: usize| data.add(i * per).read_volatile();
+            Some((0..records as usize).map(first).collect())
+        }
+    }
+
+    /// Rejected records do not wrap the budget: of 128 garbage draws (2^26
+    /// vertex instances each once clamped) two run, where a wrapping add
+    /// let four; of 600 garbage mesh dispatches 16, not 31.
+    #[test]
+    fn rejected_records_do_not_wrap_the_budget() {
+        let Some(draws) = clamped(0, &[u32::MAX], 128, 1) else {
+            return; // no host GPU here
+        };
+        assert_eq!(draws.iter().filter(|&&count| count != 0).count(), 2);
+        let meshes = clamped(10, &[u32::MAX], 600, 1).unwrap();
+        assert_eq!(meshes.iter().filter(|&&groups| groups != 0).count(), 16);
+    }
+
+    /// The budget goes to the first records, in order: of 200 draws of
+    /// 3 * 2^18 vertices the first 170 run (it ends inside the third tile);
+    /// small records that all fit all run.
+    #[test]
+    fn the_budget_goes_to_the_first_records() {
+        let Some(draws) = clamped(0, &[3 << 18, 1, 0, 0], 200, 1) else {
+            return; // no host GPU here
+        };
+        assert!(draws[..170].iter().all(|&count| count != 0));
+        assert!(draws[170..].iter().all(|&count| count == 0));
+        let small = clamped(0, &[1], 1 << 16, 1).unwrap();
+        assert!(small.iter().all(|&count| count == 1));
+    }
+
+    /// A record that does not fit ends the budget: after two draws of
+    /// 3 * 2^24 vertex instances a third takes what is left, and the small
+    /// ones after it run empty.
+    #[test]
+    fn a_record_that_does_not_fit_ends_the_budget() {
+        let mut words = [1 << 24, 3, 0, 0].repeat(3);
+        words.extend([3, 1, 0, 0].repeat(6));
+        let Some(draws) = clamped(0, &words, 8, 1) else {
+            return; // no host GPU here
+        };
+        let ran: Vec<bool> = draws.iter().map(|&count| count != 0).collect();
+        assert_eq!(ran, [true, true, false, false, false, false, false, false]);
+    }
+
+    /// The budget is the list's: a second execution of the same records
+    /// finds it spent, and they all run empty.
+    #[test]
+    fn a_spent_budget_stays_spent() {
+        let Some(twice) = clamped(1, &[u32::MAX], 64, 2) else {
+            return; // no host GPU here
+        };
+        assert!(twice.iter().all(|&count| count == 0));
     }
 }

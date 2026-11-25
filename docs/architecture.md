@@ -40,7 +40,7 @@ title's), so a run finds them under the names it gives them itself.
 | `victory-hle` | console API implementations, host pass-through policy |
 | `victory-gpu` | D3D12.X objects, command lists and GPU memory → host D3D12 |
 | `victory-shader` | Xbox shader containers → host shaders |
-| `victory-formats` | the GPU's texture layouts (sizes, tiling, detiling), audio codecs; planned: BCPack |
+| `victory-formats` | the GPU's texture layouts (sizes, tiling, detiling), BCPack, audio codecs |
 | `victory-pipeline` | converter trait, content-addressed cache |
 | `victory-game` | Grand Theft Auto VI-specific formats, build identities, hooks |
 | `apps/victory` | command-line front end |

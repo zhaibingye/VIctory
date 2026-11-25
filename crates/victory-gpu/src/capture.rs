@@ -96,7 +96,7 @@ fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: 
     );
     chunk(&mut png, b"IEND", &[]);
     let path = folder.join(format!("{name}.png"));
-    match std::fs::write(&path, png) {
+    match std::fs::create_dir_all(folder).and_then(|()| std::fs::write(&path, png)) {
         Ok(()) => tracing::info!(path = %path.display(), "frame saved"),
         Err(e) => tracing::warn!(error = %e, path = %path.display(), "frame not saved"),
     }

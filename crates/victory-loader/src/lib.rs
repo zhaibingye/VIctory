@@ -24,6 +24,7 @@
 #[cfg(windows)]
 mod crash;
 pub mod prepare;
+pub(crate) mod publish;
 pub mod resolve;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod stacks;

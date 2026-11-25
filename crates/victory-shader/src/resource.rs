@@ -221,7 +221,14 @@ pub fn track(
                         descriptor(s, Role::Sampler)?;
                     }
                 }
-                Fields::Buffer { rsrc, .. } => descriptor(rsrc, Role::Resource)?,
+                // A cache invalidation names a buffer only to scope the
+                // address range it flushes; it reads no data through the
+                // descriptor. Lowering one is a no-op on the host, so there
+                // is no descriptor to keep alive for it.
+                Fields::Buffer { rsrc, .. } if !inst.name().ends_with("_inv") => {
+                    descriptor(rsrc, Role::Resource)?
+                }
+                Fields::Buffer { .. } => {}
                 Fields::Smem { base, .. } if inst.name().starts_with("s_buffer_") => {
                     descriptor(base, Role::Resource)?;
                 }

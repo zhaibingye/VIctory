@@ -981,11 +981,46 @@ fn into_destination(
     let mut data = vec![0; len];
     let n = fill(&mut data)?;
     if super::xmem::write_physical(pages, offset, &data[..n]) {
-        Ok(())
-    } else {
-        Err(E_INVALIDARG)
+        return Ok(());
     }
+    // Page number 0 is no page (numbers start at 0x10_0000): a list naming
+    // it is one the title has not filled yet. The title writes a request's
+    // page list after enqueueing it, and a queue half full is submitted on
+    // its own, so a read can start first. Read the list again for a few
+    // milliseconds before failing: the title never looks at a request's
+    // result, so a failed one is a model or texture left unwritten.
+    if pages.contains(&0) {
+        for _ in 0..LATE_LIST_TRIES {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            // SAFETY: as above; the title's list, read again.
+            let again = unsafe {
+                std::slice::from_raw_parts(request.destination.cast::<usize>(), pages.len())
+            };
+            if !again.contains(&0) && super::xmem::write_physical(again, offset, &data[..n]) {
+                let late = LATE_LISTS.fetch_add(1, Ordering::Relaxed) + 1;
+                if late.is_power_of_two() {
+                    tracing::info!(
+                        late,
+                        "dstorage: a page list filled after its request started: written late"
+                    );
+                }
+                return Ok(());
+            }
+        }
+    }
+    tracing::warn!(
+        offset,
+        len,
+        pages = pages.len(),
+        "dstorage: a destination's physical pages could not be written; its request fails"
+    );
+    Err(E_INVALIDARG)
 }
+
+/// Milliseconds a page list naming page 0 is read again for.
+const LATE_LIST_TRIES: u32 = 8;
+/// Page lists filled after their request started (written late).
+static LATE_LISTS: AtomicU32 = AtomicU32::new(0);
 
 /// Slots by the 2020 order, which the argument shapes at Grand Theft Auto
 /// VI's call sites match (0x18, 0x20, 0x30 and 0x40 are called).
@@ -1490,6 +1525,52 @@ mod tests {
         assert_eq!(wait(array, 0), S_OK);
         // SAFETY: both pages are mapped read-write.
         let seen = unsafe { std::slice::from_raw_parts(mapped.cast::<u8>().add(PAGE - 40), 100) };
+        assert_eq!(seen, plain);
+    }
+    #[test]
+    fn a_page_list_filled_after_its_request_starts() {
+        use crate::modules::xmem;
+        let (mut given, mut page) = (1usize, [0usize; 1]);
+        assert_eq!(
+            xmem::XMemAllocatePhysicalPages(0, &mut given, page.as_mut_ptr()),
+            1
+        );
+        let mapped = xmem::XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            PAGE,
+            0x2000 | 0x2040_0000, // reserve, 64 KiB pages
+            0,
+            0x04,
+        );
+        assert!(!mapped.is_null());
+        assert_eq!(xmem::XMemMapPhysicalPages(mapped, 1, page.as_ptr()), mapped);
+
+        // The title's list, still empty when the request is submitted.
+        let list = Box::leak(Box::new([0usize; 1]));
+        let at = std::ptr::from_mut(list) as usize;
+        let plain = pattern(4096);
+        let (queue, array) = (new_queue(1), status_array(1));
+        let r = request(
+            PAGE_DESTINATION | MEMORY_SOURCE,
+            list.as_mut_ptr().cast(),
+            plain.len(),
+            plain.as_ptr().cast(),
+            0,
+            plain.len(),
+        );
+        let number = page[0];
+        let filler = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            // SAFETY: the leaked list, alive for the whole test.
+            unsafe { std::ptr::write_volatile(at as *mut usize, number) };
+        });
+        enqueue(queue, &r);
+        enqueue_status(queue, array, 0);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 0), S_OK);
+        filler.join().unwrap();
+        // SAFETY: the page is mapped read-write.
+        let seen = unsafe { std::slice::from_raw_parts(mapped.cast::<u8>(), plain.len()) };
         assert_eq!(seen, plain);
     }
     #[test]
