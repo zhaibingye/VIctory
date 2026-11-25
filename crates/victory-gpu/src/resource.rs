@@ -1166,9 +1166,45 @@ fn current(this: This) -> bool {
         .is_none_or(|live| std::sync::Arc::ptr_eq(&live, h))
 }
 
-/// A host texture of host description `d` in GPU memory, castable to
-/// [`castable`]'s formats (colour textures, through the enhanced-barrier
-/// creation; it starts in the common state) where the host takes that.
+/// Whether the host has `format` at all. A castable list naming one it does
+/// not have is refused whole (vkd3d-proton has no
+/// `R10G10B10_XR_BIAS_A2_UNORM`), and with it every castable texture.
+#[cfg(windows)]
+fn host_has(host: &crate::host::Host, format: u32) -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+    // Per format: 0 not asked yet, 1 had, 2 not.
+    static HAS: [AtomicU8; 128] = [const { AtomicU8::new(0) }; 128];
+    let Some(known) = HAS.get(format as usize) else {
+        return false;
+    };
+    match known.load(Relaxed) {
+        1 => return true,
+        2 => return false,
+        _ => {}
+    }
+    let mut data = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+        Format: DXGI_FORMAT(format as i32),
+        ..Default::default()
+    };
+    // SAFETY: the query writes its own structure of the given size.
+    let asked = unsafe {
+        host.device.CheckFeatureSupport(
+            D3D12_FEATURE_FORMAT_SUPPORT,
+            (&raw mut data).cast(),
+            size_of_val(&data) as u32,
+        )
+    };
+    let has = asked.is_ok() && data.Support1 != D3D12_FORMAT_SUPPORT1_NONE;
+    known.store(if has { 1 } else { 2 }, Relaxed);
+    has
+}
+
+/// A host texture of host description `d` in GPU memory, castable to the
+/// formats of [`castable`] the host has (colour textures, through the
+/// enhanced-barrier creation; it starts in the common state) where the host
+/// takes that.
 #[cfg(windows)]
 fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<HostTexture> {
     use windows::Win32::Graphics::Direct3D12::*;
@@ -1190,6 +1226,7 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
     };
     let mut texture: Option<ID3D12Resource> = None;
     let mut castable_formats = if d.flags & DEPTH == 0 { castable(d.format) } else { Vec::new() };
+    castable_formats.retain(|&f| host_has(host, f));
     let mut initial = crate::host::legal_for(d.flags, crate::host::texture_state(state));
     if !castable_formats.is_empty()
         && let Ok(device) = host.device.cast::<ID3D12Device10>()
@@ -1852,6 +1889,37 @@ pub(crate) fn test_buffer(width: u64) -> This {
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    /// A render target with unordered views (the title's full-screen
+    /// targets) is made castable to the formats of its element the host
+    /// has, on every host: one format it lacks does not cost it the list.
+    #[cfg(windows)]
+    #[test]
+    fn a_colour_target_is_castable_to_the_formats_the_host_has() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let d = ResourceDesc {
+            dimension: 3,
+            alignment: 0,
+            width: 256,
+            height: 256,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            format: 28,
+            sample_count: 1,
+            sample_quality: 0,
+            layout: 0,
+            flags: 5,
+        };
+        let t = make_texture(&d, 0, std::ptr::null()).unwrap();
+        let had: Vec<u32> = castable(28)
+            .into_iter()
+            .filter(|&f| host_has(host, f))
+            .collect();
+        assert!(!had.is_empty());
+        assert_eq!(t.castable, had);
+    }
 
     #[test]
     fn a8_unorm_is_not_in_the_r8_typeless_family() {
