@@ -681,12 +681,15 @@ impl HostHeap {
             // staging copy) for each of the ~20,000 the title has views of
             // ran the host out of memory (run b2).
             let later = !for_draw && is_placed_texture(&view);
-            made[index as usize] = if later { 0 } else { key };
             let (kept, mark) = if later {
                 (None, None)
             } else {
                 make_marked(&view, self.cpu(index))
             };
+            // A transient placed-allocation failure leaves a null slot
+            // for this draw, not a supposedly completed descriptor forever.
+            let pending = kept.is_none() && placed_pending(&view);
+            made[index as usize] = if later || pending { 0 } else { key };
             self.set_mark(index, mark);
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.cpu(index));
@@ -1304,6 +1307,14 @@ fn is_placed_texture(view: &View) -> bool {
     matches!(view, View::Placed(_, resource, _) if resource[0] != 1)
 }
 
+fn placed_pending(view: &View) -> bool {
+    let View::Placed(false, resource, desc) = view else {
+        return false;
+    };
+    let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+    crate::resource::placement_pending(address, resource)
+}
+
 /// A shader view of a texture the title placed in memory itself, as a view
 /// of the resource made for that memory (on first use).
 pub(crate) fn placed_texture(view: &View) -> Option<View> {
@@ -1488,6 +1499,45 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "run alone with VICTORY_D3D12_WARP=1"]
+    fn placed_texture_failure_defers_new_slots_without_blocking_an_existing_view() {
+        use crate::resource::{allow_placement_retry, REFUSE_NEXT_TEXTURE};
+        assert!(crate::switch::on("VICTORY_D3D12_WARP"));
+        allow_placement_retry();
+        let heap = HostHeap::new(false, 8).expect("WARP descriptor heap");
+        // The placed map retains descriptions in this dedicated test
+        // process. These addresses are stable and never read by the test.
+        let handle = || {
+            let address = Box::leak(Box::new([0u8; 65536])).as_mut_ptr() as u64;
+            let resource = [3, 0, 0, 0, 64, 0, 64, 0x1_0001, 28, 1, 0, 0, 0, 0];
+            let mut words = [0; 16];
+            (words[0], words[1], words[2], words[5], words[10], words[11]) = (
+                28, 4, 5768, 1, address as u32, (address >> 32) as u32,
+            );
+            let mut slot = Box::new([0u32; 8]);
+            super::super::record(slot.as_mut_ptr() as u64, View::Placed(false, resource, words));
+            slot
+        };
+        let live = handle();
+        let failed = handle();
+        let new = handle();
+        let at = |h: &[u32; 8]| h.as_ptr() as u64;
+        assert!(heap.mirror(0, at(&live), true).is_some() && heap.made(0));
+
+        REFUSE_NEXT_TEXTURE.with(|refuse| refuse.set(true));
+        assert!(heap.mirror(1, at(&failed), true).is_some() && !heap.made(1));
+        crate::resource::hold_placement_pressure_for_test();
+        assert!(heap.mirror(2, at(&new), true).is_some() && !heap.made(2));
+        // A new view of an existing backing must still be made normally.
+        assert!(heap.mirror(3, at(&live), true).is_some() && heap.made(3));
+
+        allow_placement_retry();
+        assert!(heap.mirror(1, at(&failed), true).is_some() && heap.made(1));
+        assert!(heap.mirror(2, at(&new), true).is_some() && heap.made(2));
+    }
+
 
     /// The world's 16-byte view of 0 elements removed the device.
     #[test]

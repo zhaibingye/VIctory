@@ -1308,6 +1308,11 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
     use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
     use windows::core::Interface;
     let host = crate::host::host()?;
+    #[cfg(test)]
+    if REFUSE_NEXT_TEXTURE.with(|refuse| refuse.replace(false)) {
+        note_texture_pressure();
+        return None;
+    }
     // The clear value names the format too: format, then color or depth
     // and stencil (5 words).
     let clear_value = (!clear.is_null()).then(|| {
@@ -1388,6 +1393,9 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
             )
         };
         if let Err(e) = made {
+            if e.code() == windows::Win32::Foundation::E_OUTOFMEMORY {
+                note_texture_pressure();
+            }
             tracing::warn!(error = %e, desc = ?d, "no host texture");
         }
     }
@@ -1740,6 +1748,108 @@ fn address_resource(
     )
 }
 
+/// A cached placed texture, or a failed allocation waiting to be retried.
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Default)]
+struct PlacedSlot {
+    ready: Option<usize>,
+    retry: Option<(std::time::Instant, u8)>,
+}
+
+#[cfg(any(windows, test))]
+impl PlacedSlot {
+    fn waiting(self, now: std::time::Instant) -> bool {
+        self.retry.is_some_and(|(until, _)| now < until)
+    }
+
+    fn defer(&mut self, now: std::time::Instant) {
+        let attempts = self.retry.map_or(0, |(_, attempts)| attempts);
+        let delay = std::time::Duration::from_millis(125 << attempts.min(5));
+        self.retry = Some((now + delay, attempts.saturating_add(1)));
+    }
+}
+
+/// A real device allocation refusal gives pending textures a short break,
+/// without pausing updates to already backed textures.
+#[cfg(any(windows, test))]
+#[derive(Default)]
+struct PlacementPressure {
+    until: Option<std::time::Instant>,
+}
+
+#[cfg(any(windows, test))]
+impl PlacementPressure {
+    fn active(&self, now: std::time::Instant) -> bool {
+        self.until.is_some_and(|until| now < until)
+    }
+
+    fn refuse(&mut self, now: std::time::Instant) {
+        self.until = Some(now + std::time::Duration::from_millis(125));
+    }
+}
+
+#[cfg(windows)]
+static PLACEMENT_PRESSURE: std::sync::Mutex<PlacementPressure> =
+    std::sync::Mutex::new(PlacementPressure { until: None });
+
+#[cfg(windows)]
+fn note_texture_pressure() {
+    PLACEMENT_PRESSURE.lock().unwrap_or_else(|e| e.into_inner())
+        .refuse(std::time::Instant::now());
+}
+
+#[cfg(windows)]
+fn under_texture_pressure() -> bool {
+    let mut pressure = PLACEMENT_PRESSURE.lock().unwrap_or_else(|e| e.into_inner());
+    if pressure.until.is_none() {
+        return false;
+    }
+    if pressure.active(std::time::Instant::now()) {
+        return true;
+    }
+    pressure.until = None;
+    false
+}
+
+#[cfg(all(windows, test))]
+thread_local! {
+    pub(crate) static REFUSE_NEXT_TEXTURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(all(windows, test))]
+pub(crate) fn hold_placement_pressure_for_test() {
+    let mut pressure = PLACEMENT_PRESSURE.lock().unwrap_or_else(|e| e.into_inner());
+    assert!(pressure.until.is_some(), "the refused allocation must have signalled pressure");
+    pressure.until = Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
+}
+
+#[cfg(all(windows, test))]
+pub(crate) fn allow_placement_retry() {
+    PLACEMENT_PRESSURE.lock().unwrap_or_else(|e| e.into_inner()).until = None;
+    let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    for s in map.values_mut() {
+        s.retry = None;
+    }
+}
+
+#[cfg(windows)]
+type PlacedKey = (u64, [u32; 14]);
+
+#[cfg(windows)]
+fn placed_key(address: u64, desc: &[u32; 14]) -> PlacedKey {
+    let mut desc = *desc;
+    // Words 1 and 13 are padding (stack bytes in the title's records).
+    (desc[1], desc[13]) = (0, 0);
+    (address, desc)
+}
+
+#[cfg(windows)]
+pub(crate) fn placement_pending(address: u64, desc: &[u32; 14]) -> bool {
+    PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner())
+        .get(&placed_key(address, desc))
+        .is_some_and(|slot| slot.ready.is_none() && slot.retry.is_some())
+}
+
 /// Textures the title placed in its own memory and views without a
 /// resource object (device 0x230, Grand Theft Auto VI's streamed and
 /// interface textures), by address and description: a resource at that
@@ -1748,7 +1858,7 @@ fn address_resource(
 /// description viewed); release them when the title unmaps or reuses the
 /// memory once streaming grows VRAM use.
 #[cfg(windows)]
-static PLACED_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<(u64, [u32; 14]), usize>> =
+static PLACED_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<PlacedKey, PlacedSlot>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
 #[cfg(windows)]
@@ -1832,28 +1942,34 @@ pub(crate) fn texture_at(
     view: &windows::Win32::Graphics::Direct3D12::D3D12_SHADER_RESOURCE_VIEW_DESC,
 ) -> Option<This> {
     let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
-    // Words 1 and 13 are padding (stack bytes in the title's records).
-    let mut desc = *desc;
-    (desc[1], desc[13]) = (0, 0);
-    let desc = &desc;
-    // A resource whose memory's host texture was replaced since (one with
-    // more uses) is made again, sharing the new one.
-    // shortcut: the old one is kept (view heap slots made from it view its
-    // host texture until the title rewrites them).
-    if let Some(&r) = map.get(&(address, *desc))
-        && current(r as This)
-    {
-        return Some(r as This);
+    let key = placed_key(address, desc);
+    let slot = map.get(&key).copied().unwrap_or_default();
+    let old = slot.ready.map(|r| r as This);
+    // A failed allocation yields without retaining an empty host object.
+    // A still-live generation (including sparse backing) never waits for it.
+    if old.is_some_and(current) {
+        return old;
+    }
+    if slot.retry.is_some() && slot.waiting(std::time::Instant::now()) {
+        return old;
+    }
+    if under_texture_pressure() {
+        // Mark the view pending even if the global wait expires before
+        // the heap records this attempt as a null descriptor.
+        if old.is_none() {
+            map.entry(key).or_default().retry.get_or_insert((std::time::Instant::now(), 0));
+        }
+        return old;
     }
     // SAFETY: 56 bytes in the description's layout.
-    let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
+    let d = unsafe { key.1.as_ptr().cast::<ResourceDesc>().read_unaligned() };
     if d.dimension == BUFFER {
         return None;
     }
     // Never select sparse backing where an existing title texture can
     // already have written this memory, or when replacing a generation.
     let sparse_prefix = if crate::sparse::enabled()
-        && !map.contains_key(&(address, *desc))
+        && old.is_none()
         && !TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&address)
     {
         sparse_missing_prefix(&d, view, usize::try_from(address).ok()?)
@@ -1865,10 +1981,18 @@ pub(crate) fn texture_at(
         address, d, 0, std::ptr::null(), &RESOURCE_IIDS[0], &mut out, sparse_prefix,
     );
     if made != S_OK {
-        return None;
+        return old;
     }
-    map.insert((address, *desc), out as usize);
-    resource(out).host.is_some().then_some(out)
+    if resource(out).host.is_none() {
+        map.entry(key).or_default().defer(std::time::Instant::now());
+        // No descriptor ever saw this failed object. Do not keep it (and
+        // don't enter the bindless cleanup while holding the placed map).
+        drop(map);
+        resource_release(out);
+        return old;
+    }
+    map.insert(key, PlacedSlot { ready: Some(out as usize), retry: None });
+    Some(out)
 }
 
 pub(crate) extern "system" fn create_placed(
@@ -2105,6 +2229,45 @@ mod tests {
         assert_eq!(target.format, 67);
     }
 
+
+    #[test]
+    fn placed_allocation_refusal_yields_then_retries_without_affecting_other_slots() {
+        use std::time::{Duration, Instant};
+        let start = Instant::now();
+        let mut refused = PlacedSlot::default();
+        let live = PlacedSlot { ready: Some(1), retry: None };
+        assert!(!refused.waiting(start));
+        refused.defer(start);
+        assert!(refused.waiting(start + Duration::from_millis(124)));
+        let second = start + Duration::from_millis(125);
+        assert!(!refused.waiting(second));
+        refused.defer(second);
+        assert!(refused.waiting(second + Duration::from_millis(249)));
+        assert!(!refused.waiting(second + Duration::from_millis(250)));
+        assert!(!live.waiting(start));
+        assert_eq!(live.ready, Some(1));
+        for _ in 0..100 {
+            refused.defer(start);
+        }
+        assert!(!refused.waiting(start + Duration::from_secs(4)));
+        assert!(refused.ready.is_none());
+    }
+
+    #[test]
+    fn texture_pressure_expires_without_extending_on_deferred_work() {
+        use std::time::{Duration, Instant};
+        let now = Instant::now();
+        let mut pressure = PlacementPressure::default();
+        assert!(!pressure.active(now));
+        pressure.refuse(now);
+        for t in 0..125 {
+            assert!(pressure.active(now + Duration::from_millis(t)));
+        }
+        assert!(!pressure.active(now + Duration::from_millis(125)));
+        pressure.refuse(now + Duration::from_millis(125));
+        assert!(pressure.active(now + Duration::from_millis(249)));
+        assert!(!pressure.active(now + Duration::from_millis(250)));
+    }
 
     use crate::object::slot;
 
