@@ -27,7 +27,10 @@
 //! Loaded one at a time, 650 pipelines kept the eight workers to one core
 //! for minutes, while each title frame could wait out its 500 ms for
 //! them (`make`). Stores and serialising keep the lock: the size asked for
-//! must still be right when the bytes are written.
+//! must still be right when the bytes are written. Loads take no lock at
+//! all, since a load adds nothing to the library: a save holds the lock
+//! while it serialises the whole library (hundreds of megabytes in the
+//! world), and loads that waited on it stalled every worker for as long.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -65,6 +68,19 @@ struct Library {
 // SAFETY: D3D12 objects are free-threaded (a pipeline library with the
 // exception `NAMES` takes care of).
 unsafe impl Send for Library {}
+
+/// The library for loads, beside the one stores and saves lock.
+struct Shared {
+    /// The same library as `state`'s, loaded from without its lock.
+    loads: ID3D12PipelineLibrary1,
+    state: Mutex<Library>,
+}
+
+// SAFETY: as for `Library`.
+unsafe impl Send for Shared {}
+// SAFETY: the library is free-threaded but for loads of one name, which
+// `NAMES` keeps apart; the rest is behind `state`'s lock.
+unsafe impl Sync for Shared {}
 
 /// Names one thread at a time holds.
 struct Names {
@@ -117,8 +133,8 @@ const PREBUILT_FILE: &str = "prebuilt-pipelines.txt";
 /// Title pipelines listed for an early start, at most.
 const EARLY_MAX: usize = 8192;
 
-fn library() -> Option<&'static Mutex<Library>> {
-    static LIBRARY: OnceLock<Option<Mutex<Library>>> = OnceLock::new();
+fn library() -> Option<&'static Shared> {
+    static LIBRARY: OnceLock<Option<Shared>> = OnceLock::new();
     LIBRARY
         .get_or_init(|| {
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
@@ -135,7 +151,7 @@ fn library() -> Option<&'static Mutex<Library>> {
             if library.is_none() {
                 tracing::warn!("no host pipeline library: pipelines are not kept");
             }
-            library.map(Mutex::new)
+            library.map(|l| Shared { loads: l.library.clone(), state: Mutex::new(l) })
         })
         .as_ref()
 }
@@ -217,13 +233,13 @@ fn listed(list: &[u8], tag: &str) -> HashSet<String> {
 
 /// Whether the pre-build has the title pipeline `key` in the library.
 pub(crate) fn prebuilt(key: &str) -> bool {
-    library().is_some_and(|l| l.lock().unwrap_or_else(|e| e.into_inner()).prebuilt.contains(key))
+    library().is_some_and(|l| l.state.lock().unwrap_or_else(|e| e.into_inner()).prebuilt.contains(key))
 }
 
 /// The pre-build has the title pipeline `key` in the library now.
 pub(crate) fn note_prebuilt(key: String) {
     if let Some(l) = library() {
-        let mut l = l.lock().unwrap_or_else(|e| e.into_inner());
+        let mut l = l.state.lock().unwrap_or_else(|e| e.into_inner());
         l.prebuilt_changed |= l.prebuilt.insert(key);
     }
 }
@@ -256,14 +272,10 @@ pub(crate) fn pipeline(
         return create();
     };
     let _held = NAMES.hold(name);
-    // The interface alone under the lock: loads take up to seconds. Its
-    // blob lives as long as the library, which is never dropped.
-    let loads = library
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .library
-        .clone();
-    if let Ok(pso) = load(&loads, PCWSTR(wide.as_ptr())) {
+    // Outside the lock: loads take up to seconds, and a save holds the lock
+    // for as long as it serialises. The library's blob lives as long as it
+    // does, which is never dropped.
+    if let Ok(pso) = load(&library.loads, PCWSTR(wide.as_ptr())) {
         LOADED.fetch_add(1, Ordering::Relaxed);
         return Ok(pso);
     }
@@ -272,7 +284,7 @@ pub(crate) fn pipeline(
     LAST.set(Some((name.to_owned(), false)));
     let pso = create()?;
     MADE.fetch_add(1, Ordering::Relaxed);
-    let mut l = library.lock().unwrap_or_else(|e| e.into_inner());
+    let mut l = library.state.lock().unwrap_or_else(|e| e.into_inner());
     // SAFETY: a live pipeline; a name already stored (a description that
     // differs) is refused, which leaves the library as it was.
     if unsafe { l.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok() {
@@ -303,7 +315,7 @@ pub(crate) fn save(now: bool) {
         *last = Some(std::time::Instant::now());
     }
     let (blob, prebuilt) = {
-        let mut l = library.lock().unwrap_or_else(|e| e.into_inner());
+        let mut l = library.state.lock().unwrap_or_else(|e| e.into_inner());
         if l.added == 0 && !l.prebuilt_changed && !USED_CHANGED.swap(false, Ordering::Relaxed) {
             return;
         }
@@ -638,6 +650,101 @@ mod tests {
         for (i, code) in codes.iter().enumerate() {
             shared.load(i, code).expect("every pipeline");
         }
+    }
+
+    /// A stored pipeline loads while a save holds the library's lock (one
+    /// serialises the whole library, for seconds in the world).
+    #[test]
+    fn a_pipeline_loads_while_a_save_holds_the_library() {
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::core::s;
+        let (Some(device), Some(library)) = (
+            crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok()),
+            library(),
+        ) else {
+            return; // no host GPU here
+        };
+        // No resources, and the root signature made apart: a compiler need
+        // not keep one the source names (Wine's does not).
+        let source = "[numthreads(1, 1, 1)] void main() {}";
+        let mut blob = None;
+        // SAFETY: the source outlives the call; the blob is read within it.
+        let code = unsafe {
+            if D3DCompile(
+                source.as_ptr().cast(),
+                source.len(),
+                None,
+                None,
+                None,
+                s!("main"),
+                s!("cs_5_1"),
+                0,
+                0,
+                &mut blob,
+                None,
+            )
+            .is_err()
+            {
+                return; // no shader compiler here
+            }
+            let blob = blob.unwrap();
+            std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize())
+                .to_vec()
+        };
+        // SAFETY: an empty description; the blob is read while it lives.
+        let root: ID3D12RootSignature = unsafe {
+            let mut blob = None;
+            D3D12SerializeRootSignature(
+                &D3D12_ROOT_SIGNATURE_DESC::default(),
+                D3D_ROOT_SIGNATURE_VERSION_1,
+                &mut blob,
+                None,
+            )
+            .unwrap();
+            let blob = blob.unwrap();
+            let bytes = std::slice::from_raw_parts(
+                blob.GetBufferPointer().cast::<u8>(),
+                blob.GetBufferSize(),
+            );
+            device.CreateRootSignature(0, bytes).unwrap()
+        };
+        struct Made(ID3D12Device1, ID3D12RootSignature, Vec<u8>);
+        // SAFETY: D3D12 objects are free-threaded.
+        unsafe impl Sync for Made {}
+        impl Made {
+            fn get(&self, made: bool) -> windows::core::Result<ID3D12PipelineState> {
+                let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    // SAFETY: a borrowed pointer the description never releases.
+                    pRootSignature: unsafe { std::mem::transmute_copy(&self.1) },
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: self.2.as_ptr().cast(),
+                        BytecodeLength: self.2.len(),
+                    },
+                    ..Default::default()
+                };
+                pipeline(
+                    "test: a pipeline loads while a save holds the library",
+                    // SAFETY: the description points at live data.
+                    |library, name| unsafe { library.LoadComputePipeline(name, &desc) },
+                    || match made {
+                        // SAFETY: as above.
+                        true => unsafe { self.0.CreateComputePipelineState(&desc) },
+                        false => panic!("made again, not loaded"),
+                    },
+                )
+            }
+        }
+        let made = Made(device, root, code);
+        made.get(true).expect("made and stored");
+        let saving = library.state.lock().unwrap_or_else(|e| e.into_inner());
+        let (done, loaded) = std::sync::mpsc::channel();
+        std::thread::scope(|s| {
+            let made = &made;
+            s.spawn(move || done.send(made.get(false).is_ok()));
+            let loaded = loaded.recv_timeout(std::time::Duration::from_secs(30));
+            drop(saving);
+            assert_eq!(loaded, Ok(true), "the load waited for the save");
+        });
     }
 
     #[test]
