@@ -113,7 +113,7 @@ enum Command {
         #[arg(long)]
         execute: bool,
         /// The console model the title sees (device type, memory).
-        #[arg(long, value_enum, default_value_t = Console::SeriesX)]
+        #[arg(long, value_enum, default_value_t = Console::SeriesS)]
         console: Console,
         /// Arguments for the title, after `--` (it reads the whole command
         /// line; a title that relaunches itself passes some).
@@ -241,4 +241,23 @@ pub(crate) fn default_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
         "no paths given and none configured (see victory.example.toml)"
     );
     Ok(all)
+}
+
+#[cfg(test)]
+mod console_args_tests {
+    use super::{Cli, Command, Console, Parser};
+
+    fn console(flags: &[&str]) -> Console {
+        let args = ["victory", "run", "example.exe"].into_iter().chain(flags.iter().copied());
+        let cli = Cli::try_parse_from(args).expect("valid run arguments");
+        let Command::Run { console, .. } = cli.command else { panic!("expected run") };
+        console
+    }
+
+    #[test]
+    fn run_defaults_to_series_s_and_retains_both_explicit_modes() {
+        assert!(matches!(console(&["--execute"]), Console::SeriesS));
+        assert!(matches!(console(&["--console", "series-x"]), Console::SeriesX));
+        assert!(matches!(console(&["--console", "series-s"]), Console::SeriesS));
+    }
 }

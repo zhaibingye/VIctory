@@ -132,13 +132,16 @@ extern "system" fn execute(_: This, count: u32, lists: *const This) {
     }
 }
 
-/// The start of a present plane: frame token, then the plane's resources.
+/// One plane of a `PresentX` call (0x48-byte stride): frame token,
+/// resource count, and pointer to the plane's resources.
 #[repr(C)]
 pub(crate) struct Plane {
     token: u64,
     count: u32,
     resources: *const This,
+    _rest: [u64; 6],
 }
+const _: () = assert!(std::mem::size_of::<Plane>() == 0x48);
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
 extern "system" fn execute_x(this: This, count: u32, lists: *const This, _token: u64, _flags: u32) {
@@ -280,24 +283,47 @@ extern "system" fn present(
     }
     #[cfg(windows)]
     if planes > 0
-        // SAFETY: the title passes `planes` plane descriptions.
-        && let Some(plane) = unsafe { plane_parameters.as_ref() }
-        && plane.count > 0
-        && !plane.resources.is_null()
-        // SAFETY: the plane lists `count` resources.
-        && let resource = unsafe { *plane.resources }
-        && let Some(texture) = crate::resource::host_resource(resource)
+        && !plane_parameters.is_null()
         && let Some(host) = crate::host::host()
     {
         const COPY_SOURCE: u32 = 0x800;
-        let state = crate::resource::host_transition(resource, COPY_SOURCE)
-            .map_or(COPY_SOURCE, |(_, before)| before);
-        let shown = host.present(texture, state, frame);
-        crate::resource::host_transition(resource, state);
-        #[cfg(feature = "diagnostics")]
-        blinks(frame, resource, state, shown);
-        #[cfg(not(feature = "diagnostics"))]
-        let _ = shown;
+        // SAFETY: the title passes `planes` plane descriptions.
+        let slice = unsafe { std::slice::from_raw_parts(plane_parameters, planes.min(8) as usize) };
+        use windows::core::Interface;
+        let mut sources: Vec<(&windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32)> =
+            Vec::with_capacity(slice.len());
+        let mut restore = Vec::with_capacity(slice.len());
+        for plane in slice {
+            if plane.count == 0 || plane.resources.is_null() {
+                continue;
+            }
+            // SAFETY: the plane lists count resources.
+            let resource = unsafe { *plane.resources };
+            if let Some(texture) = crate::resource::host_resource(resource) {
+                // Several title objects may share one host texture. Keep their
+                // plane order but transition and restore that host copy once.
+                let state = match sources.iter().find(|(seen, _)| seen.as_raw() == texture.as_raw()) {
+                    Some(&(_, state)) => state,
+                    None => {
+                        let state = crate::resource::host_transition(resource, COPY_SOURCE)
+                            .map_or(COPY_SOURCE, |(_, before)| before);
+                        restore.push((resource, state));
+                        state
+                    }
+                };
+                sources.push((texture, state));
+            }
+        }
+        if !sources.is_empty() {
+            let shown = host.present(&sources, frame);
+            for &(resource, state) in &restore {
+                crate::resource::host_transition(resource, state);
+            }
+            #[cfg(feature = "diagnostics")]
+            blinks(frame, restore[0].0, restore[0].1, shown);
+            #[cfg(not(feature = "diagnostics"))]
+            let _ = shown;
+        }
     }
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);
