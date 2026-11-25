@@ -64,19 +64,26 @@ fn err(e: windows::core::Error) -> String {
 
 impl Host {
     /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`).
+    /// A software default adapter (a machine without a GPU, as CI) is
+    /// refused, so hardware-only checks never run on WARP.
     pub fn new(warp: bool) -> Result<Self, String> {
         let warp = warp || std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
         // SAFETY: plain D3D12/DXGI calls with valid out pointers.
         unsafe {
             let mut device: Option<ID3D12Device> = None;
-            if warp {
-                let factory: IDXGIFactory4 =
-                    CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
-                let adapter: IDXGIAdapter = factory.EnumWarpAdapter().map_err(err)?;
-                D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
+            let factory: IDXGIFactory4 =
+                CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
+            let adapter: IDXGIAdapter1 = if warp {
+                factory.EnumWarpAdapter().map_err(err)?
             } else {
-                D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
-            }
+                let adapter = factory.EnumAdapters1(0).map_err(err)?;
+                if adapter.GetDesc1().map_err(err)?.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0
+                {
+                    return Err("no hardware adapter".into());
+                }
+                adapter
+            };
+            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
             let device = device.ok_or("no device")?;
             let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
                 HighestShaderModel: D3D_SHADER_MODEL_6_6,
