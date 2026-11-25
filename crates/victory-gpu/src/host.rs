@@ -760,8 +760,9 @@ enum Step {
     Run(Box<dyn Fn() + Send>),
     /// Work that writes host memory only.
     Host(Box<dyn Fn() + Send>),
-    /// Shaders write a range (address, bytes) of a buffer's host copy.
-    GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
+    /// Shaders write a range (address, bytes) of a buffer's host copy;
+    /// whether they mark the pages they write (no snapshot then).
+    GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize, bool),
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
     Texture(std::sync::Arc<crate::texture::Staging>),
@@ -1090,7 +1091,7 @@ impl Host {
             // the title's own data (runs c1, c4).
             let missed = deferred.missed.iter().any(|check| check());
             for step in &deferred.copies {
-                if let Step::GpuWrite(shadow, address, len) = step {
+                if let Step::GpuWrite(shadow, address, len, _) = step {
                     let key = (std::sync::Arc::as_ptr(shadow) as usize, *address, *len);
                     match index.get(&key) {
                         Some(&i) => back[i].3 &= !missed,
@@ -1102,6 +1103,14 @@ impl Host {
                 }
             }
         }
+        // Pages shaders marked first: the copy-backs below end what the
+        // copies keep for them.
+        let withheld: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = back
+            .iter()
+            .filter(|b| !b.3)
+            .map(|(s, a, n, _)| (s.clone(), *a, *n))
+            .collect();
+        crate::shadow::copy_back_marks(&withheld);
         for (shadow, address, len, goes_back) in &back {
             let (address, len) = (*address, *len);
             if *goes_back {
@@ -1752,16 +1761,18 @@ impl HostList {
     }
 
     /// Shaders of the list write `[address, address + len)` of a buffer's
-    /// host copy: copied back into title memory once the list has run.
+    /// host copy: copied back into title memory once the list has run
+    /// (`marked`: the pages they mark).
     pub(crate) fn defer_gpu_write(
         &self,
         shadow: &std::sync::Arc<crate::shadow::Shadow>,
         address: usize,
         len: usize,
+        marked: bool,
     ) {
         self.deferred()
             .copies
-            .push(Step::GpuWrite(shadow.clone(), address, len));
+            .push(Step::GpuWrite(shadow.clone(), address, len, marked));
     }
 
     /// Shaders of the list take views from the heap itself
@@ -1965,10 +1976,13 @@ impl HostList {
                     }
                     continue;
                 }
-                Step::GpuWrite(shadow, address, len) => {
-                    // The shaders start from the title's data.
-                    batch.flush();
-                    shadow.writing(*address, *len);
+                Step::GpuWrite(shadow, address, len, marked) => {
+                    // The shaders start from the title's data, which a
+                    // snapshot must hold (marked ranges keep none).
+                    if !marked {
+                        batch.flush();
+                    }
+                    shadow.writing(*address, *len, *marked);
                     continue;
                 }
                 Step::Texture(staging) => {
@@ -3329,7 +3343,7 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         let copy = crate::shadow::find(title as u64, PAGE as u64).unwrap();
         assert_eq!(copy.update(title, PAGE), PAGE);
         let busy = title + 32;
-        copy.writing(busy, 4);
+        copy.writing(busy, 4, false);
         for (offset, value) in [(4, 11u8), (16, 22), (32, 33), (40, 44)] {
             // SAFETY: every marker belongs to the test's live title page.
             unsafe { ((title + offset) as *mut u8).write_volatile(value) };

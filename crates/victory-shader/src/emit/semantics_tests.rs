@@ -292,6 +292,7 @@ fn lower_program(words: &[u32]) -> Result<HostShader, String> {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        view_marks: false,
     })
     .map_err(e)?;
     Ok(HostShader {
@@ -308,6 +309,7 @@ fn lower_program(words: &[u32]) -> Result<HostShader, String> {
         view_addresses: lowered.view_addresses,
         heap: lowered.heap,
         heap_writes: lowered.heap_writes,
+        view_marks: lowered.view_marks,
     })
 }
 

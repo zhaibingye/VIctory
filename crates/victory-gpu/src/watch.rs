@@ -42,8 +42,41 @@ use std::sync::{Arc, Mutex};
 /// they saved.
 pub(crate) const PAGE: usize = 64 << 10;
 
-/// The pages a tracker has not taken since they changed.
-struct Changed(Mutex<BTreeSet<usize>>);
+/// The pages a tracker has not taken since they changed, and what it saves
+/// of pages it armed.
+struct Changed(Mutex<BTreeSet<usize>>, Mutex<Saved>);
+
+/// Pages (page numbers) whose bytes a tracker keeps when they are first
+/// written after it took them, and those bytes: while shaders may be
+/// writing its copy of them, what it held before (`crate::shadow`'s
+/// copy-back of marked pages).
+#[derive(Default)]
+struct Saved {
+    armed: BTreeSet<usize>,
+    bytes: std::collections::HashMap<usize, Box<[u8]>>,
+}
+
+impl Changed {
+    /// Page `page` was taken: what it saved of it is stale.
+    fn taken(&self, page: usize) {
+        self.1.lock().unwrap_or_else(|e| e.into_inner()).bytes.remove(&page);
+    }
+
+    /// Page `page` is about to change for the first time since it was
+    /// taken: its bytes now, if armed for it.
+    fn save(&self, page: usize) {
+        let mut saved = self.1.lock().unwrap_or_else(|e| e.into_inner());
+        if !saved.armed.contains(&page) || saved.bytes.contains_key(&page) {
+            return;
+        }
+        let mut bytes = vec![0u8; PAGE].into_boxed_slice();
+        if crate::host::read_into((page * PAGE) as *const u8, &mut bytes) {
+            saved.bytes.insert(page, bytes);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::SavedPages, 1);
+        }
+    }
+}
 
 /// Title memory a host copy or texture staging takes: bytes `[start, end)`.
 pub(crate) struct Tracked {
@@ -181,7 +214,7 @@ pub(crate) fn track(start: usize, len: usize, views: bool) -> Option<Tracked> {
     install();
     let end = start + len;
     let pages = start / PAGE..end.div_ceil(PAGE);
-    let changed = Arc::new(Changed(Mutex::new(pages.clone().collect())));
+    let changed = Arc::new(Changed(Mutex::new(pages.clone().collect()), Mutex::default()));
     let mut g = guards();
     for page in pages {
         g.holders.entry(page).or_default().push(changed.clone());
@@ -293,6 +326,7 @@ impl Tracked {
         drop(asked);
         for page in protect(&mut g, &whole) {
             changed.remove(&page);
+            self.changed.taken(page);
         }
         drop(changed);
         drop(g);
@@ -325,7 +359,37 @@ impl Tracked {
         guard_aliases(&mut g, &others);
         for page in protect(&mut g, pages) {
             changed.remove(&page);
+            self.changed.taken(page);
         }
+    }
+
+    /// Shaders may write the copy's bytes `[from, to)` until [`Tracked::disarm`]:
+    /// pages there written next after they were taken have their bytes kept
+    /// first ([`Tracked::saved`]).
+    pub(crate) fn arm(&self, from: usize, to: usize) {
+        let (from, to) = (from.max(self.start), to.min(self.end));
+        if from < to {
+            self.changed.1.lock().unwrap_or_else(|e| e.into_inner()).armed.extend(from / PAGE..to.div_ceil(PAGE));
+        }
+    }
+
+    /// Page `page` (a page number) needs no saving any more: its copy-back
+    /// is under way.
+    pub(crate) fn unarm(&self, page: usize) {
+        self.changed.1.lock().unwrap_or_else(|e| e.into_inner()).armed.remove(&page);
+    }
+
+    /// No shader writes the copy any more: nothing is armed or kept.
+    pub(crate) fn disarm(&self) {
+        let mut saved = self.changed.1.lock().unwrap_or_else(|e| e.into_inner());
+        saved.armed.clear();
+        saved.bytes.clear();
+    }
+
+    /// The bytes page `page` (a page number) held when it was first written
+    /// since it was taken, if it was armed then (and so changed).
+    pub(crate) fn saved(&self, page: usize) -> Option<Box<[u8]>> {
+        self.changed.1.lock().unwrap_or_else(|e| e.into_inner()).bytes.remove(&page)
     }
 }
 
@@ -395,8 +459,8 @@ fn protect(g: &mut Guards, pages: &[usize]) -> Vec<usize> {
 /// elsewhere: gives write access back where we guarded them and marks them
 /// in every tracker holding them. True if one of `[first, last)` was
 /// guarded.
-fn changed(g: &mut Guards, first: usize, last: usize) -> bool {
-    let guarded = changed_here(g, first, last);
+fn changed(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
+    let guarded = changed_here(g, first, last, save);
     let others: Vec<usize> = g.alias_of.range(first..last).flat_map(|(_, o)| o.iter().copied()).collect();
     #[cfg(feature = "diagnostics")]
     {
@@ -404,20 +468,24 @@ fn changed(g: &mut Guards, first: usize, last: usize) -> bool {
         crate::copystat::add(crate::copystat::C::AliasMarks, held as u64);
     }
     for page in others {
-        changed_here(g, page, page + 1);
+        changed_here(g, page, page + 1, save);
     }
     guarded
 }
 
-/// [`changed`] of `[first, last)` alone.
-fn changed_here(g: &mut Guards, first: usize, last: usize) -> bool {
+/// [`changed`] of `[first, last)` alone. With `save`, before the write
+/// lands: trackers armed for a page they had taken keep its bytes.
+fn changed_here(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
     let guarded: Vec<usize> = g.protected.range(first..last).copied().collect();
     for &page in &guarded {
         open(g, page);
     }
     for (&page, holders) in g.holders.range(first..last) {
         for c in holders {
-            c.0.lock().unwrap_or_else(|e| e.into_inner()).insert(page);
+            let first_write = c.0.lock().unwrap_or_else(|e| e.into_inner()).insert(page);
+            if first_write && save {
+                c.save(page);
+            }
         }
         #[cfg(feature = "diagnostics")]
         g.written.insert(page);
@@ -453,7 +521,7 @@ impl Drop for Writing {
         if let Some(i) = g.busy.iter().position(|&r| r == (self.first, self.last)) {
             g.busy.swap_remove(i);
         }
-        changed(&mut g, self.first, self.last);
+        changed(&mut g, self.first, self.last, false);
     }
 }
 
@@ -468,7 +536,7 @@ pub fn writing(at: usize, len: usize) -> Writing {
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     let mut g = guards();
     g.busy.push((first, last));
-    changed(&mut g, first, last);
+    changed(&mut g, first, last, true);
     Writing { first, last }
 }
 
@@ -477,7 +545,8 @@ pub fn writing(at: usize, len: usize) -> Writing {
 pub fn title_memory_remapped(at: usize, len: usize) {
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     let mut g = guards();
-    changed(&mut g, first, last);
+    // What it showed is gone already: nothing to keep.
+    changed(&mut g, first, last, false);
     // What it showed is not what it shows now: its links go, both ways.
     let stale: Vec<usize> = g.alias_of.range(first..last).map(|(&p, _)| p).collect();
     for page in stale {
@@ -537,7 +606,7 @@ fn install() {
         // since this one faulted, and a copy may have guarded it again since
         // (then it is ours again, not read-only for some other reason).
         let mut g = guards();
-        if changed(&mut g, at / PAGE, at / PAGE + 1) {
+        if changed(&mut g, at / PAGE, at / PAGE + 1, true) {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::GuardFaults, 1);
             return EXCEPTION_CONTINUE_EXECUTION;
