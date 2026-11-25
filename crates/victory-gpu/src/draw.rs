@@ -2491,5 +2491,25 @@ void main(uint3 id : SV_DispatchThreadID) {
         drop(found);
         slots.make_null(0);
         assert!(shown.upgrade().is_none(), "released with the slot");
+
+        // Dynamic tables retain their copy while their list owns the slot.
+        let first = slots.dynamic(1).unwrap();
+        let next = slots.dynamic(1).unwrap();
+        let hold = |index, address| {
+            let view = view(address);
+            slots.make_at(index, &view);
+            let copy = crate::descriptor::host::view_copy(&view).unwrap().0;
+            std::sync::Arc::downgrade(&copy)
+        };
+        let released = hold(first, start + 100);
+        let kept = hold(next, start + 104);
+        let mut state = State::default();
+        state.dynamic.push((heap as usize, first, 1));
+        assert!(released.upgrade().is_some());
+        drop(state);
+        assert!(released.upgrade().is_none(), "the released table still owns its copy");
+        assert!(kept.upgrade().is_some(), "another table still owns its copy");
+        slots.release(next, 1);
+        assert!(kept.upgrade().is_none());
     }
 }

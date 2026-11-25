@@ -379,6 +379,11 @@ impl HostHeap {
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let end = (at + n).min(self.dynamic) as usize;
         if let Some(slots) = guard.1.get_mut(at as usize..end) {
+            let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+            let views = &mut kept[first as usize..self.count as usize + end];
+            for (offset, view) in views.iter_mut().enumerate() {
+                self.replace_kept(first + offset as u32, view, None);
+            }
             slots.fill(false);
         }
     }
@@ -515,25 +520,29 @@ impl HostHeap {
     fn keep(&self, index: u32, resource: Kept) {
         let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(slot) = kept.get_mut(index as usize) {
-            let old = std::mem::replace(slot, resource);
-            #[cfg(feature = "diagnostics")]
-            if let Some((old, _)) = &old
-                && !self.sampler
-                && slot.as_ref().map(|s| windows::core::Interface::as_raw(&s.0)) != Some(windows::core::Interface::as_raw(old))
-                // SAFETY: a live resource.
-                && unsafe { old.GetDesc() }.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER
-            {
-                use windows::core::Interface;
-                let left = crate::resource::life::holders(old);
-                crate::resource::life::note(old.as_raw() as usize, crate::resource::life::SLOT, u64::from(index), left);
-            }
-            // Title threads rewrite slots while the GPU runs a submission;
-            // one of its shaders may hold the old descriptor (or read the
-            // slot at an index from wrong data): what it views is freed
-            // only once that work has run.
-            if let Some((old, _)) = old {
-                crate::host::retire(old);
-            }
+            self.replace_kept(index, slot, resource);
+        }
+    }
+
+    fn replace_kept(&self, _index: u32, slot: &mut Kept, resource: Kept) {
+        let old = std::mem::replace(slot, resource);
+        #[cfg(feature = "diagnostics")]
+        if let Some((old, _)) = &old
+            && !self.sampler
+            && slot.as_ref().map(|s| windows::core::Interface::as_raw(&s.0)) != Some(windows::core::Interface::as_raw(old))
+            // SAFETY: a live resource.
+            && unsafe { old.GetDesc() }.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER
+        {
+            use windows::core::Interface;
+            let left = crate::resource::life::holders(old);
+            crate::resource::life::note(old.as_raw() as usize, crate::resource::life::SLOT, u64::from(_index), left);
+        }
+        // Title threads rewrite slots while the GPU runs a submission;
+        // one of its shaders may hold the old descriptor (or read the
+        // slot at an index from wrong data): what it views is freed
+        // only once that work has run.
+        if let Some((old, _)) = old {
+            crate::host::retire(old);
         }
     }
 
