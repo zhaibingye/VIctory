@@ -39,6 +39,8 @@ pub(crate) struct Staging {
     buffer: ID3D12Resource,
     /// Its bytes.
     size: u64,
+    #[cfg(feature = "diagnostics")]
+    _upload_bytes: UploadBytes<'static>,
     data: *mut u8,
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
@@ -62,6 +64,40 @@ struct Last {
 /// Shared scratch buffer for reading tracked title-texture memory before
 /// detiling, so each `Staging` does not retain a full-size `Vec<u8>`.
 static READ_SCRATCH: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+
+#[cfg(feature = "diagnostics")]
+static LIVE_UPLOAD_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Keep the accounting with the staging object, including any references held
+/// by command lists. No global list of staging objects is needed.
+#[cfg(feature = "diagnostics")]
+struct UploadBytes<'a> {
+    total: &'a std::sync::atomic::AtomicU64,
+    size: u64,
+}
+
+#[cfg(feature = "diagnostics")]
+impl<'a> UploadBytes<'a> {
+    fn new(total: &'a std::sync::atomic::AtomicU64, size: u64) -> Self {
+        total.fetch_add(size, std::sync::atomic::Ordering::Relaxed);
+        Self { total, size }
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+impl Drop for UploadBytes<'_> {
+    fn drop(&mut self) {
+        self.total.fetch_sub(self.size, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Logical upload-buffer bytes and shared CPU scratch capacity, not OS commit.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn retained_copy_bytes() -> (u64, Option<usize>) {
+    let upload = LIVE_UPLOAD_BYTES.load(std::sync::atomic::Ordering::Relaxed);
+    let scratch = READ_SCRATCH.try_lock().ok().map(|s| s.capacity());
+    (upload, scratch)
+}
 
 // SAFETY: the staging mapping is written only at submission, under
 // `last`'s lock; the title memory is only read.
@@ -474,6 +510,8 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     let s = Arc::new(Staging {
         buffer,
         size: total,
+        #[cfg(feature = "diagnostics")]
+        _upload_bytes: UploadBytes::new(&LIVE_UPLOAD_BYTES, total),
         data,
         footprints,
         rows,
@@ -490,6 +528,24 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn upload_bytes_follow_the_allocation_not_its_arc_references() {
+        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+        let total = AtomicU64::new(0);
+        let upload = Arc::new(UploadBytes::new(&total, 73));
+        let in_flight = upload.clone();
+        let other = UploadBytes::new(&total, 51);
+        assert_eq!(total.load(Relaxed), 124);
+        drop(upload);
+        assert_eq!(total.load(Relaxed), 124);
+        drop(other);
+        assert_eq!(total.load(Relaxed), 73);
+        drop(in_flight);
+        assert_eq!(total.load(Relaxed), 0);
+    }
 
     #[test]
     fn subresource_len_stays_inside_staging_total() {

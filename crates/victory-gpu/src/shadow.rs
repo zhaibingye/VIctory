@@ -54,6 +54,12 @@ type Snapshot = (Vec<(usize, Vec<u8>)>, std::collections::HashSet<usize>);
 /// Snapshot memory kept for reuse (already touched, so no page faults).
 static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 
+/// Capacity of idle snapshots, excluding submissions that hold active ones.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn idle_snapshot_bytes() -> Option<usize> {
+    POOL.try_lock().ok().map(|pool| pool.iter().map(Vec::capacity).sum())
+}
+
 /// An empty buffer with room for `n` bytes, from the pool if it has one.
 fn pooled(n: usize) -> Vec<u8> {
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
