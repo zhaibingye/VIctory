@@ -368,14 +368,27 @@ void main(uint3 id : SV_DispatchThreadID) {
 }
 "#;
 
-    fn compile() -> (ID3D12RootSignature, ID3D12PipelineState) {
+    /// Adds the raw dwords of slot 0 to those of slot 1 (64), as translated
+    /// shaders read untyped buffers whatever their views.
+    const ADD: &str = r#"
+#define RS "DescriptorTable(SRV(t0), UAV(u0))"
+ByteAddressBuffer src : register(t0);
+RWByteAddressBuffer dst : register(u0);
+[RootSignature(RS)]
+[numthreads(16, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    dst.Store(id.x * 4, src.Load(id.x * 4) + dst.Load(id.x * 4));
+}
+"#;
+
+    fn compile(source: &str) -> (ID3D12RootSignature, ID3D12PipelineState) {
         let host = crate::host::host().unwrap();
         let (mut code, mut errors): (Option<ID3DBlob>, Option<ID3DBlob>) = (None, None);
         // SAFETY: the source and names outlive the call.
         unsafe {
             D3DCompile(
-                SOURCE.as_ptr().cast(),
-                SOURCE.len(),
+                source.as_ptr().cast(),
+                source.len(),
                 s!("heap"),
                 None,
                 None,
@@ -586,7 +599,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         crate::descriptor::create_uav(null, dst, null, &uav, slot(1));
         crate::descriptor::create_srv(null, tex, std::ptr::null(), slot(2));
         let heap_host = title_heap.host().expect("a host view heap");
-        let (root, pso) = compile();
+        let (root, pso) = compile(SOURCE);
         let list = host.new_list().unwrap();
         let (dst_bytes, _) = crate::resource::buffer_bytes(dst).unwrap();
         let out = crate::shadow::find(dst_bytes as u64, 256).expect("the output's host copy");
@@ -612,5 +625,77 @@ void main(uint3 id : SV_DispatchThreadID) {
                 assert_eq!(v, base + i as u32 + u32::from(texel), "round {round}, dword {i}");
             }
         }
+    }
+
+    /// Structured views (16-byte elements, as the lighting's pre-exposure
+    /// and the alpha prepass's thresholds) read and written as raw bytes:
+    /// every dword comes through. Through a structured host shader resource
+    /// view an RTX 5090 read zeros here from dword 16 on, and at byte 20 in
+    /// translated shaders (`descriptor::host::raw_window`).
+    #[test]
+    fn raw_reads_of_structured_views_are_right() {
+        // 16 elements of 16 bytes: no format, buffer dimension, then (the
+        // default mapping,) first element, count, stride, flags; or 64 raw
+        // dwords (R32_TYPELESS, the raw flag).
+        let srv: [[u32; 10]; 2] = [[0, 1, 0x1688, 0, 0, 0, 16, 16, 0, 0], [39, 1, 0x1688, 0, 0, 0, 64, 0, 1, 0]];
+        let uav: [[u32; 10]; 2] = [[0, 1, 0, 0, 16, 16, 0, 0, 0, 0], [39, 1, 0, 0, 64, 0, 0, 0, 1, 0]];
+        for (read, write, what) in [(0, 1, "a structured view read"), (1, 0, "a structured unordered view read and written")] {
+            let Some(words) = add_through(&srv[read], &uav[write]) else {
+                return; // no host GPU here
+            };
+            for (i, &v) in words.iter().enumerate() {
+                assert_eq!(v, 1000 + 0x10001 * i as u32, "{what}: dword {i}");
+            }
+        }
+    }
+
+    /// What [`ADD`] leaves through a view `uav` of a buffer holding 0,
+    /// 0x10000, 0x20000, ... with a view `srv` of one holding 1000, 1001, ...
+    /// (64 dwords each).
+    fn add_through(srv: &[u32; 10], uav: &[u32; 10]) -> Option<Vec<u32>> {
+        let host = crate::host::host()?;
+        let null = std::ptr::null();
+        let (src, dst) = (resource(1, 256, 1, 0, 1), resource(1, 256, 1, 0, 1));
+        let (src_bytes, _) = crate::resource::buffer_bytes(src).unwrap();
+        let (dst_bytes, _) = crate::resource::buffer_bytes(dst).unwrap();
+        // SAFETY: the buffers' own memory, 256 bytes each.
+        let (from, to) = unsafe {
+            (
+                std::slice::from_raw_parts_mut(src_bytes.cast::<u32>(), 64),
+                std::slice::from_raw_parts_mut(dst_bytes.cast::<u32>(), 64),
+            )
+        };
+        for (i, (a, b)) in from.iter_mut().zip(to).enumerate() {
+            (*a, *b) = (1000 + i as u32, 0x10000 * i as u32);
+        }
+        let heap_desc: [u32; 8] = [0, 8, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(
+            0x8efb471d,
+            0x616c,
+            0x4f49,
+            [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+        );
+        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap), S_OK);
+        let title_heap = crate::descriptor::heap(heap);
+        let slot = |i: u64| title_heap.start + 32 * i;
+        crate::descriptor::create_srv(null, src, srv, slot(0));
+        crate::descriptor::create_uav(null, dst, null, uav, slot(1));
+        let heap_host = title_heap.host().expect("a host view heap");
+        let (root, pso) = compile(ADD);
+        let list = host.new_list().unwrap();
+        // SAFETY: an open list, live objects of ours.
+        unsafe {
+            list.list.SetDescriptorHeaps(&[Some(heap_host.heap.clone())]);
+            list.list.SetComputeRootSignature(&root);
+            list.list.SetComputeRootDescriptorTable(0, heap_host.gpu(0));
+            list.list.SetPipelineState(&pso);
+            list.list.Dispatch(4, 1, 1);
+        }
+        list.defer_heap(&heap_host.viewed);
+        list.close();
+        host.execute(&[&list]);
+        let out = crate::shadow::find(dst_bytes as u64, 256).expect("the output's host copy");
+        Some(out.read_host(dst_bytes as u64, 64))
     }
 }
