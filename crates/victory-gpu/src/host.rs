@@ -2499,7 +2499,7 @@ struct Meter {
     since: std::time::Instant,
     frames: u32,
     #[cfg(feature = "diagnostics")]
-    copy_stats_frames: u64,
+    diagnostic_frames: u64,
     drawn: u64,
     logged: std::time::Instant,
     /// The caption the window had, once read.
@@ -2513,7 +2513,7 @@ impl Meter {
             since: now,
             frames: 0,
             #[cfg(feature = "diagnostics")]
-            copy_stats_frames: 0,
+            diagnostic_frames: 0,
             drawn: crate::draw::drawn(),
             logged: now,
             caption: None,
@@ -2530,7 +2530,7 @@ impl Meter {
         crate::watch::frame_done();
         #[cfg(feature = "diagnostics")]
         {
-            self.copy_stats_frames += 1;
+            self.diagnostic_frames += 1;
         }
         let elapsed = self.since.elapsed();
         if elapsed < std::time::Duration::from_secs(1) {
@@ -2556,9 +2556,6 @@ impl Meter {
         let dropped = crate::draw::take_dropped() as f64 / frames;
         let indirect = crate::list::take_indirect() as f64 / frames;
         let root_views = crate::draw::take_root_view_slots() as f64 / frames;
-        // Over the same frames as the counts above.
-        #[cfg(feature = "diagnostics")]
-        let drops = crate::pipeline::take_drops();
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
             tracing::info!(
@@ -2581,14 +2578,17 @@ impl Meter {
             );
             #[cfg(feature = "diagnostics")]
             {
-                let copy_frames = std::mem::take(&mut self.copy_stats_frames) as f64;
-                crate::copystat::log(copy_frames);
-                crate::bindless::log(copy_frames);
-                crate::shadow::log_views(copy_frames);
+                let diagnostic_frames = std::mem::take(&mut self.diagnostic_frames) as f64;
+                // Drain the reasons when reporting them. The window caption's
+                // shorter updates must leave the earlier drops in this interval.
+                let drops = crate::pipeline::take_drops();
+                crate::copystat::log(diagnostic_frames);
+                crate::bindless::log(diagnostic_frames);
+                crate::shadow::log_views(diagnostic_frames);
                 for (why, n) in drops.iter().take(40) {
                     tracing::info!(
                         "dropped {:.1}/frame without a host pipeline: {why}",
-                        *n as f64 / frames
+                        *n as f64 / diagnostic_frames
                     );
                 }
             }
