@@ -4608,12 +4608,25 @@ impl<'a> Lower<'a> {
                 .collect()
         };
         let words = if total < 32 {
-            // A byte or half inside the dword that holds it.
-            let (not3, three) = (self.s.m.i32(!3), self.s.m.i32(3));
-            let at = self.s.m.bin(c, Bin::And, off, not3);
+            // A byte or half inside the dword that holds it. A constant
+            // offset is aligned here: vkd3d-proton turns a load at a
+            // constant offset into the same access as the buffer's other
+            // accesses, and one at a computed offset into a per-component
+            // raw access, which on NVIDIA does not see a dword the same
+            // invocation stored just before.
+            let (at, sh) = match self.s.m.int_value(off) {
+                Some(o) => {
+                    let o = o as u32;
+                    (self.s.m.i32(o & !3), self.s.m.i32((o & 3) * 8))
+                }
+                None => {
+                    let (not3, three) = (self.s.m.i32(!3), self.s.m.i32(3));
+                    let at = self.s.m.bin(c, Bin::And, off, not3);
+                    let byte = self.s.m.bin(c, Bin::And, off, three);
+                    (at, self.s.m.bin(c, Bin::Shl, byte, three))
+                }
+            };
             let w = load(self, at, 1)[0];
-            let byte = self.s.m.bin(c, Bin::And, off, three);
-            let sh = self.s.m.bin(c, Bin::Shl, byte, three);
             vec![self.s.m.bin(c, Bin::LShr, w, sh)]
         } else {
             load(self, off, total / 32)
