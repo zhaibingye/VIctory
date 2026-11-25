@@ -394,12 +394,17 @@ impl Shadow {
         if !busy.is_empty() {
             // Around ranges shaders are writing: the gaps, each as below
             // (in the world most submissions have such ranges; copying the
-            // gaps whole cost ~1 s per frame).
+            // gaps whole cost ~1 s per frame). Under them, what the title
+            // wrote since it was taken (`update_busy`).
             busy.sort_unstable();
             let (mut at, mut bytes) = (from, 0);
             for (a, e) in busy {
+                let (a, e) = (a.max(from), e.min(to));
                 if a > at {
                     bytes += self.update_free(at, a);
+                }
+                if e > a.max(at) {
+                    bytes += self.update_busy(a.max(at), e);
                 }
                 at = at.max(e);
             }
@@ -409,6 +414,41 @@ impl Shadow {
             return bytes;
         }
         self.update_free(from, to)
+    }
+
+    /// [`Shadow::update`] of `[from, to)` where a list submitted earlier
+    /// declared that shaders write. A submission waits for the one before it,
+    /// so none of this submission's shaders has run yet: the pages the title
+    /// wrote since they were taken are copied as anywhere else. Skipped, the
+    /// title's constants there stayed stale for the whole submission (a
+    /// dispatch read its sizes as zeros and looped until the device was
+    /// removed). The same bytes go into the snapshot `writing` took, so
+    /// copy-back neither takes them for the GPU's nor puts them back over a
+    /// later title write.
+    fn update_busy(&self, from: usize, to: usize) -> usize {
+        let Some(t) = &self.tracked else {
+            return 0;
+        };
+        let runs = t.take(from, to);
+        if runs.is_empty() {
+            return 0;
+        }
+        let start = self.start as usize;
+        let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let mut copied = 0;
+        for (a, b) in runs {
+            copied += self.copy(a, b);
+            let (a, b) = (a - start, b - start);
+            for (at, bytes) in before.0.iter_mut() {
+                let (s, e) = ((*at).max(a), (*at + bytes.len()).min(b));
+                if s < e {
+                    // SAFETY: inside the mapping.
+                    let host = unsafe { std::slice::from_raw_parts(self.data.add(s), e - s) };
+                    bytes[s - *at..e - *at].copy_from_slice(host);
+                }
+            }
+        }
+        copied
     }
 
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
@@ -698,6 +738,41 @@ pub(crate) fn near(va: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The title writes a constant under a range an earlier list of the
+    /// submission declared as written by shaders: the refresh before the
+    /// submission runs still brings it to the copy, a shader's write still
+    /// goes back, and a title write made after the refresh is not undone.
+    #[test]
+    fn title_writes_under_a_busy_range_are_copied() {
+        let p = crate::watch::tests::pool(2);
+        let len = 2 * PAGE;
+        register(p, p as u64, len as u64);
+        let Some(copy) = find(p as u64, len as u64) else {
+            unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        let title = |at: usize| (p + at) as *mut u8;
+        let host = |at: usize| copy.read_host((p + at) as u64 & !3, 1)[0].to_le_bytes()[at % 4];
+        copy.update(p, len);
+        // An earlier list declares all of it as written by shaders.
+        copy.writing(p, len);
+        // SAFETY: (all title reads and writes below) bytes of our pool.
+        unsafe { title(PAGE + 20).write_volatile(0x55) };
+        assert!(copy.update(p + PAGE + 16, 16) > 0, "the title's write is copied");
+        assert_eq!(host(PAGE + 20), 0x55, "the title's constant reaches the copy");
+        // The shaders run: one byte written. The title writes meanwhile.
+        copy.write_host((p + 10) as u64, &[0xaa]);
+        // SAFETY: a byte of our pool.
+        unsafe { title(PAGE + 20).write_volatile(0x66) };
+        copy.copy_back(p, len);
+        // SAFETY: bytes of our pool.
+        unsafe {
+            assert_eq!(title(10).read_volatile(), 0xaa, "the shader's write goes back");
+            assert_eq!(title(PAGE + 20).read_volatile(), 0x66, "the title's later write stays");
+        }
+        unregister(p, p as u64);
+    }
 
     /// Ranges shaders write far apart are kept apart (not the copy between
     /// them); what the GPU wrote goes back once, whichever overlapping
