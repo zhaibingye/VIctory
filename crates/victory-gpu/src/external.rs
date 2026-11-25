@@ -46,3 +46,14 @@ pub fn record<R>(
     });
     out
 }
+
+/// Write the title's upscaler output with the rendered colour input.
+pub fn spatial_upscale(
+    list: *const Object,
+    colour: *const Object,
+    output: *const Object,
+    render: [u32; 2],
+    upscale: [u32; 2],
+) -> bool {
+    crate::upscale::record(list, colour, output, render, upscale)
+}

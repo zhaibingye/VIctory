@@ -237,6 +237,47 @@ pub(crate) fn pc_format(format: u32) -> u32 {
     }
 }
 
+/// Shared-exponent RGB is sampleable on PC but cannot be a D3D12 render
+/// target. Keep the packed format in title memory and on ordinary sampled
+/// textures. For GPU-rendered colour, use float16 RGBA to preserve range.
+pub(crate) const fn target_format(format: u32) -> u32 {
+    match format {
+        67 => 10,
+        other => other,
+    }
+}
+
+/// Format for a view whose console target has a different host representation.
+#[cfg(windows)]
+pub(crate) fn pc_view_format(this: This, format: u32) -> u32 {
+    if format == 67 && stands_in(this) { target_format(format) } else { format }
+}
+
+#[cfg(windows)]
+pub(crate) fn stands_in(this: This) -> bool {
+    if this.is_null() || resource(this).desc.format != 67 {
+        return false;
+    }
+    // SAFETY: the returned host resource lives with the title resource.
+    host_resource(this).is_some_and(|r| unsafe { r.GetDesc() }.Format.0 as u32 == target_format(67))
+}
+
+#[cfg(windows)]
+pub(crate) fn copy_formats_match(dst: This, src: This) -> bool {
+    if !stands_in(dst) && !stands_in(src) {
+        return true;
+    }
+    // A raw footprint or a texture with a different host format cannot
+    // carry the stand-in's eight-byte texels.
+    let compatible = host_resource(dst).zip(host_resource(src))
+        .is_some_and(|(a, b)| unsafe { a.GetDesc().Format == b.GetDesc().Format });
+    if !compatible {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| tracing::warn!("copy between packed RGB9E5 and its host render target needs format conversion"));
+    }
+    compatible
+}
+
 /// The typeless format of a format's family (itself if it has none).
 pub(crate) fn family(format: u32) -> u32 {
     const FAMILIES: [(u32, u32); 22] = [
@@ -285,7 +326,7 @@ pub(crate) fn view_format(this: This) -> Option<u32> {
     let host = host_resource(this)?;
     // SAFETY: a live resource.
     let format = unsafe { host.GetDesc() }.Format.0 as u32;
-    (format != own).then_some(own)
+    (format != own && !stands_in(this)).then_some(own)
 }
 
 /// Depth formats with their typeless family: depth textures that shaders
@@ -1040,6 +1081,9 @@ fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
         d.flags &= !UNORDERED;
     }
     d.format = pc_format(d.format);
+    if d.flags & 0x1 != 0 {
+        d.format = target_format(d.format);
+    }
     const DENY_SHADER_RESOURCE: u32 = 8;
     if d.flags & DENY_SHADER_RESOURCE == 0
         && let Some(&(_, typeless)) = DEPTH_FORMATS.iter().find(|&&(f, _)| f == d.format)
@@ -1270,6 +1314,9 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
         // SAFETY: the title passes a whole clear value.
         let mut value = unsafe { clear.cast::<[u32; 5]>().read_unaligned() };
         value[0] = pc_format(value[0]);
+        if d.flags & 0x1 != 0 {
+            value[0] = target_format(value[0]);
+        }
         value
     });
     let clear_value = clear_value.as_ref().map(|v| std::ptr::from_ref(v).cast::<D3D12_CLEAR_VALUE>());
@@ -2037,6 +2084,28 @@ pub(crate) fn test_buffer(width: u64) -> This {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn render_target_translation_does_not_change_title_texture_bytes() {
+        assert_eq!(pc_format(67), 67);
+        assert_eq!(element(67), Some((4, 1)));
+        assert_eq!(element(target_format(67)), Some((8, 1)));
+        assert_eq!(target_format(28), 28);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shared_exponent_changes_only_the_host_render_target() {
+        let sampled = texture(64, 64, 67, 1);
+        assert_eq!(host_desc(&sampled).unwrap().format, 67);
+        let target = ResourceDesc { flags: 1, ..sampled };
+        let host = host_desc(&target).unwrap();
+        assert_eq!(host.format, 10);
+        assert_eq!(host.flags, 1);
+        assert_eq!(target.format, 67);
+    }
+
+
     use crate::object::slot;
 
     /// A render target with unordered views (the title's full-screen

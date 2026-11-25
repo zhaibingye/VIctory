@@ -151,6 +151,9 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
     ) else {
         return;
     };
+    if !crate::resource::copy_formats_match(to, from) {
+        return;
+    }
     // An odd key: textures' own first uses are keyed by the host texture.
     if !list.first_use(to as usize | 1) {
         return;

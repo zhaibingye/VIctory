@@ -274,7 +274,8 @@ impl RtvRecord {
     #[cfg(windows)]
     fn host_desc<T>(&self, dimension: u32) -> Option<T> {
         assert!(size_of::<T>() <= size_of::<[u32; 6]>());
-        let words = self.host_words(dimension, || crate::resource::view_format(self.resource))?;
+        let mut words = self.host_words(dimension, || crate::resource::view_format(self.resource))?;
+        words[0] = crate::resource::pc_view_format(self.resource, words[0]);
         // SAFETY: both host view descriptions are 24 bytes in this layout.
         Some(unsafe { (&raw const words).cast::<T>().read_unaligned() })
     }

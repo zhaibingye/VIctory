@@ -197,6 +197,11 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
 | `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
 
+With the Series S profile and no working PC FidelityFX provider, VIctory can
+fill the console upscaler's output with a spatial bilinear pass. It uses the
+title's own render and output sizes; it does not set a resolution or replace
+temporal FidelityFX quality. The Series X dispatch path is unchanged.
+
 Every build appends unhandled exceptions, panics, and host GPU failures to
 `crashes.log` in the title's data folder.
 

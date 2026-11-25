@@ -35,6 +35,32 @@ fn check_cpu_features() -> Result<()> {
     check_cpu_features_with(has_avx2, skip.as_deref())
 }
 
+
+#[cfg(windows)]
+struct SeriesSImports<'a> {
+    inner: &'a dyn victory_loader::ImportResolver,
+    spatial: bool,
+}
+
+#[cfg(windows)]
+impl victory_loader::ImportResolver for SeriesSImports<'_> {
+    fn resolve(&self, dll: &str, symbol: &victory_pe::ImportSymbol) -> victory_loader::Resolution {
+        use victory_hle::modules::fidelityfx;
+        use victory_loader::{Provenance, Resolution};
+        let resolved = self.inner.resolve(dll, symbol);
+        if self.spatial && dll.eq_ignore_ascii_case(fidelityfx::LOADER_DLL)
+            && matches!(symbol, victory_pe::ImportSymbol::Name { name, .. } if name == "ffxDispatch")
+            // Do not displace a working PC FidelityFX provider.
+            && let Resolution::Found { address, provenance: Provenance::Title } = resolved
+            // SAFETY: this was resolved from the title's FidelityFX DLL
+            // through WithTitleDlls, which lives throughout title execution.
+            && let Some(address) = unsafe { fidelityfx::spatial_dispatch(address) }
+        {
+            return Resolution::Found { address, provenance: Provenance::Hle };
+        }
+        resolved
+    }
+}
 #[cfg(windows)]
 pub fn run(
     exe: &Path,
@@ -163,7 +189,11 @@ pub fn run(
         show(name, dll.bind_imports(&with_dlls, policy)?);
     }
     let exe_name = exe.file_name().unwrap_or_default().to_string_lossy();
-    show(&exe_name, image.bind_imports(&with_dlls, policy)?);
+    let imports = SeriesSImports {
+        inner: &with_dlls,
+        spatial: matches!(console, Console::SeriesS),
+    };
+    show(&exe_name, image.bind_imports(&imports, policy)?);
     if !execute {
         println!("not executing (pass --execute to start the title)");
         return Ok(0);

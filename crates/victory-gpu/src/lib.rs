@@ -76,3 +76,6 @@ pub use watch::{
 
 #[cfg(test)]
 mod bc1_detile_experiment;
+
+#[cfg(windows)]
+mod upscale;

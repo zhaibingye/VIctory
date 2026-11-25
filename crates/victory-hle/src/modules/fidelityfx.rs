@@ -29,6 +29,8 @@ use windows::core::Interface;
 
 use crate::{HleModule, hle_export};
 
+pub const LOADER_DLL: &str = "amd_fidelityfx_loader_xbox.dll";
+
 /// The PC build's upscaler, which has the five functions itself.
 const DLL: &str = "amd_fidelityfx_upscaler_dx12.dll";
 
@@ -138,6 +140,7 @@ unsafe impl Send for Host {}
 unsafe impl Sync for Host {}
 
 static HOST: OnceLock<Host> = OnceLock::new();
+static CONSOLE_DISPATCH: OnceLock<Call> = OnceLock::new();
 
 macro_rules! once {
     ($level:ident, $($arg:tt)*) => {{
@@ -437,10 +440,60 @@ extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
     .unwrap_or(PARAMETER)
 }
 
+
+/// Bind the Series S compatibility dispatch only over a resolved title
+/// export. Preserve the original loader, its contexts and all other calls.
+///
+/// # Safety
+/// `original` must be the title loader's live FidelityFX dispatch export.
+pub unsafe fn spatial_dispatch(original: usize) -> Option<usize> {
+    if original == 0 {
+        return None;
+    }
+    // SAFETY: the caller resolved the typed, live export for this title.
+    let target = unsafe { std::mem::transmute::<usize, Call>(original) };
+    let saved = CONSOLE_DISPATCH.get_or_init(|| target);
+    if *saved as usize != original {
+        return None;
+    }
+    Some(series_s_dispatch as *const () as usize)
+}
+
+extern "C" fn series_s_dispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
+    // SAFETY: the title passes the API header; inspect the whole structure
+    // only for the known dispatch kind.
+    if let Some(header) = unsafe { desc.as_ref() }
+        && header.kind == DISPATCH_UPSCALE
+    {
+        let d = unsafe { &*desc.cast::<DispatchUpscale>() };
+        let [render, upscale] = dispatch_sizes(d);
+        if victory_gpu::external::spatial_upscale(
+            d.list.cast::<Object>(),
+            d.resources[0].resource.cast::<Object>(),
+            d.resources[6].resource.cast::<Object>(),
+            render,
+            upscale,
+        ) {
+            once!(info, ?render, ?upscale, "Series S: using the spatial FidelityFX compatibility pass");
+            return OK;
+        }
+        once!(warn, "Series S: spatial pass unavailable for this dispatch; using the title's FidelityFX");
+    }
+    CONSOLE_DISPATCH.get().map_or(NO_PROVIDER, |dispatch| {
+        // SAFETY: forwarded unchanged to the export registered by the loader.
+        unsafe { dispatch(context, desc) }
+    })
+}
+
+fn dispatch_sizes(d: &DispatchUpscale) -> [[u32; 2]; 2] {
+    // Four leading words are the jitter and motion-vector scale floats.
+    [[d.rest[4], d.rest[5]], [d.rest[6], d.rest[7]]]
+}
+
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "fidelityfx",
-        dlls: &["amd_fidelityfx_loader_xbox.dll"],
+        dlls: &[LOADER_DLL],
         exports: vec![
             hle_export!(ffxConfigure),
             hle_export!(ffxCreateContext),
@@ -454,6 +507,19 @@ pub(crate) fn module() -> HleModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spatial_dispatch_uses_render_and_upscale_dimensions() {
+        let d = DispatchUpscale {
+            header: Header { kind: DISPATCH_UPSCALE, next: null_mut() },
+            list: null_mut(),
+            resources: [Resource { resource: null_mut(), description: [0; 8], state: 0 }; 7],
+            rest: [99, 98, 97, 96, 3, 2, 5, 3, 42, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        };
+        assert_eq!(dispatch_sizes(&d), [[3, 2], [5, 3]]);
+        assert_eq!(std::mem::offset_of!(DispatchUpscale, rest), 0x168);
+        assert_eq!(std::mem::offset_of!(DispatchUpscale, resources) + 6 * size_of::<Resource>(), 0x138);
+    }
 
     fn header(kind: u64, next: *mut Header) -> Header {
         Header { kind, next }

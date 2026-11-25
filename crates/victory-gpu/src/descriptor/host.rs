@@ -1188,6 +1188,9 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             if let Some(copy) = crate::resource::host_copy(resource) {
                 let texture = &copy.texture;
                 let mut desc = desc.as_ref().map(srv_desc);
+                if let Some(d) = &mut desc {
+                    d.Format.0 = crate::resource::pc_view_format(resource, d.Format.0 as u32) as i32;
+                }
                 if desc.is_none() && !default_view(resource) {
                     return None;
                 }
@@ -1234,6 +1237,9 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     .map(|twin| Some((twin, None)));
             }
             let mut desc = desc.as_ref().map(uav_desc);
+            if let Some(d) = &mut desc {
+                d.Format.0 = crate::resource::pc_view_format(resource, d.Format.0 as u32) as i32;
+            }
             if desc.is_none() && !default_view(resource) {
                 return None;
             }
