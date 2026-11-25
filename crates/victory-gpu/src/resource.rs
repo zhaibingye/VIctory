@@ -1008,8 +1008,9 @@ fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
     // PC refuses depth targets that are also unordered-access (the console
     // allows both; Grand Theft Auto VI's shadow maps and material depth ask
     // for it): unordered views of such a texture write its twin
-    // (`crate::twin`).
-    if d.flags & DEPTH != 0 {
+    // (`crate::twin`). It refuses unordered access on multisampled textures
+    // too.
+    if d.flags & DEPTH != 0 || d.sample_count > 1 {
         d.flags &= !UNORDERED;
     }
     d.format = pc_format(d.format);
@@ -2512,5 +2513,34 @@ mod tests {
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn msaa_textures_drop_unordered_access() {
+        let msaa_rt = ResourceDesc {
+            sample_count: 4,
+            flags: 1 | UNORDERED,
+            ..texture(64, 64, 28, 1)
+        };
+        let host = host_desc(&msaa_rt).expect("host texture description");
+        assert_eq!(host.flags, 1, "MSAA render target drops UAV but keeps RT");
+        assert_eq!(crate::host::legal_for(host.flags, 0x8), 0);
+
+        let msaa_srgb = ResourceDesc {
+            sample_count: 2,
+            flags: 1 | UNORDERED,
+            ..texture(64, 64, 29, 1)
+        };
+        let host_srgb = host_desc(&msaa_srgb).expect("host sRGB texture description");
+        assert_eq!(host_srgb.flags, 1);
+        assert_eq!(host_srgb.format, 29, "sRGB stays typed once UAV is dropped");
+
+        let single = ResourceDesc {
+            sample_count: 1,
+            flags: 1 | UNORDERED,
+            ..texture(64, 64, 28, 1)
+        };
+        assert_eq!(host_desc(&single).unwrap().flags, 1 | UNORDERED);
     }
 }
