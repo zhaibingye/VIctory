@@ -12,6 +12,7 @@ use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
 };
 use crate::{io, ir, resource, structure};
+use windows::Win32::Graphics::Direct3D12::D3D12_COMPARISON_FUNC_LESS;
 
 /// Per lane (32, wave32): the record [offset word, u, v, level] at entry 1
 /// of the table at s0 (a 2D texture at entry 0, a raw UAV at entry 2); the
@@ -122,6 +123,14 @@ fn build(words: &[u32]) -> Result<HostShader, crate::ShaderError> {
 }
 
 fn lowered(native: &NativeProgram) -> Result<lower::Lowered, crate::ShaderError> {
+    lowered_with(native, Vec::new())
+}
+
+/// As [`lowered`], with these outputs declared (a pixel program's depth).
+fn lowered_with(
+    native: &NativeProgram,
+    outputs: Vec<super::container::SigElement>,
+) -> Result<lower::Lowered, crate::ShaderError> {
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
@@ -133,7 +142,7 @@ fn lowered(native: &NativeProgram) -> Result<lower::Lowered, crate::ShaderError>
         io: &io,
         res: &res,
         inputs: Vec::new(),
-        outputs: Vec::new(),
+        outputs,
         prims: Vec::new(),
         mesh_stride: 0,
         view_marks: false,
@@ -356,6 +365,253 @@ fn permutes_read_the_lane_named_and_zero_from_lanes_left_out() {
             )
             .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
         assert_eq!(out[0], want, "{label}");
+    }
+}
+
+/// A pixel program the console runs after the depth test
+/// (`DEPTH_BEFORE_SHADER`) runs after it on the host too
+/// (`[earlydepthstencil]`): it writes an unordered view, so without the flag
+/// the host would run it, and keep its writes, for hidden pixels. Without
+/// the bit it is not forced.
+#[test]
+fn pixel_programs_tested_before_they_run_keep_that_order() {
+    let code: Vec<u32> = vec![
+        0xBE84_0308, // s_mov_b32 s4, s8
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF40C_0302,
+        0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0x0
+        0x7E00_0280, // v_mov_b32 v0, 0
+        0x7E02_0280, // v_mov_b32 v1, 0
+        0x7E04_02F2, // v_mov_b32 v2, 1.0
+        0x7E06_0280, // v_mov_b32 v3, 0
+        0x7E08_0280, // v_mov_b32 v4, 0
+        0x7E0A_02F2, // v_mov_b32 v5, 1.0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xF020_1F08,
+        0x0003_0200, // image_store v[2:5], v[0:1], s[12:19] dmask:0xf dim:2D unorm
+        0xF800_1890,
+        0x0000_0000, // exp null off, off, off, off done vm
+        0xBF81_0000, // s_endpgm
+    ];
+    let native = |db_shader_control| NativeProgram {
+        stage: HwStage::Ps,
+        wave64: true,
+        vgprs: 8,
+        layout: vec![RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 8,
+            slot: 0,
+        }],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 8,
+            user_data: 8,
+            slot: 0,
+        }],
+        io: StageIo::Ps {
+            inputs: Vec::new(),
+            input_addr: 0,
+            db_shader_control,
+            patches: Vec::new(),
+        },
+        code: code.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    // DEPTH_BEFORE_SHADER, with the Z order the console pairs it with
+    // (early Z then late Z, bits 4-5).
+    let early = lowered(&native(1 << 12 | 1 << 4)).expect("lower");
+    assert!(early.early_depth);
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut early.dxil.clone())
+            .expect("DXIL validation failed");
+    }
+    let late = lowered(&native(1 << 4)).expect("lower");
+    assert!(!late.early_depth);
+
+    // What the host does with them: one triangle over the whole target at
+    // depth 0.5, tested LESS against a depth buffer cleared to 1 (every
+    // pixel visible) or 0 (every pixel hidden). The program stores
+    // (1, 0, 0, 1) at texel (0, 0) of its UAV.
+    let pixel = |l: lower::Lowered| HostShader {
+        stage: HwStage::Ps,
+        dxil: l.dxil,
+        user_data: l.user_data,
+        samplers: l.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: l.root_cbvs,
+        root_srvs: l.root_srvs,
+        root_uavs: l.root_uavs,
+        memory: l.memory,
+        memory_writes: l.memory_writes,
+        view_addresses: l.view_addresses,
+        heap: l.heap,
+        heap_writes: l.heap_writes,
+        view_marks: l.view_marks,
+    };
+    let (early, late) = (pixel(early), pixel(late));
+    let vs = super::host::position_vs();
+    let triangle = [
+        -1.0, -1.0, 0.5, 1.0, //
+        -1.0, 3.0, 0.5, 1.0, //
+        3.0, -1.0, 0.5, 1.0,
+    ];
+    const STORED: [f32; 4] = [1.0, 0.0, 0.0, 1.0];
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        // The texel the program stores to, after a draw with depth cleared
+        // to `clear`.
+        let draw = |ps: &HostShader, clear: f32| -> [f32; 4] {
+            let root = host.root_signature(&vs, ps).expect("root signature");
+            let pso = host
+                .depth_tested_pipeline(&root, &vs.dxil, &ps.dxil, D3D12_COMPARISON_FUNC_LESS)
+                .unwrap_or_else(|e| panic!("{label}: pipeline refused: {e}"));
+            let roots = vec![
+                (
+                    0,
+                    Root::Constants(vec![0; vs.user_data_dwords().max(1) as usize]),
+                ),
+                (
+                    1,
+                    Root::Constants(vec![0; ps.user_data_dwords().max(1) as usize]),
+                ),
+            ];
+            let texels = host
+                .draw_behind_depth(&root, &pso, &roots, &triangle, (8, 8), clear)
+                .unwrap_or_else(|e| panic!("{label}: draw failed: {e}"));
+            assert!(
+                texels[1..].iter().all(|t| *t == [0.0; 4]),
+                "{label}: stores only at (0, 0)"
+            );
+            texels[0]
+        };
+        ran += 1;
+        // Visible: the flagged program runs and stores (the draw, the
+        // depth test and the UAV binding all work).
+        assert_eq!(
+            draw(&early, 1.0),
+            STORED,
+            "{label}: a visible pixel's store"
+        );
+        // Hidden: tested first, it does not run, so nothing is stored.
+        assert_eq!(
+            draw(&early, 0.0),
+            [0.0; 4],
+            "{label}: hidden pixels store nothing"
+        );
+        // Hidden, without the flag: a host may run a program that writes
+        // unordered views before testing depth, and keep its stores. That
+        // is what the flag prevents; seeing it shows the test can tell.
+        // (Both the RTX 5070 Ti and WARP store here.)
+        assert_eq!(
+            draw(&late, 0.0),
+            STORED,
+            "{label}: without the flag hidden pixels store (depth tested after)"
+        );
+    }
+    assert!(ran > 0, "no device");
+}
+
+/// A pixel program the console runs with depth tested first that also
+/// exports depth keeps the flag. The console tests the rasterized depth
+/// before the program then (its export reaches only a late test that does
+/// not change the outcome), and so does a host with the flag; DXIL's
+/// validator has no rule against the pair (DirectXShaderCompiler's
+/// sources), and the hardware device and WARP take and draw it.
+#[test]
+fn a_program_tested_first_that_exports_depth_keeps_the_flag() {
+    // Stores nothing; exports depth 0.5 (`exp mrtz`), the program the
+    // compiler makes for `[earlydepthstencil] float main() : SV_Depth`.
+    let code: Vec<u32> = vec![
+        0x7E00_02F0, // v_mov_b32 v0, 0.5
+        0xF800_1881,
+        0x0000_0000, // exp mrtz v0, off, off, off done vm
+        0xBF81_0000, // s_endpgm
+    ];
+    let native = |db_shader_control| NativeProgram {
+        stage: HwStage::Ps,
+        wave64: true,
+        vgprs: 4,
+        layout: Vec::new(),
+        used: Vec::new(),
+        io: StageIo::Ps {
+            inputs: Vec::new(),
+            input_addr: 0,
+            db_shader_control,
+            patches: Vec::new(),
+        },
+        code: code.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let depth = super::container::SigElement {
+        name: "SV_Depth".into(),
+        index: 0,
+        kind: 17,
+        comp: 9,
+        interp: 0,
+        row: None,
+        col: 0,
+        cols: 1,
+        usage: 1,
+        half: false,
+    };
+    // Z_EXPORT_ENABLE (bit 0) with DEPTH_BEFORE_SHADER.
+    let l = lowered_with(&native(1 << 12 | 1), vec![depth]).expect("lower");
+    assert!(
+        l.early_depth,
+        "the flag follows the bit with a depth export too"
+    );
+    let ps = HostShader {
+        stage: HwStage::Ps,
+        dxil: l.dxil,
+        user_data: l.user_data,
+        samplers: l.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: l.root_cbvs,
+        root_srvs: l.root_srvs,
+        root_uavs: l.root_uavs,
+        memory: l.memory,
+        memory_writes: l.memory_writes,
+        view_addresses: l.view_addresses,
+        heap: l.heap,
+        heap_writes: l.heap_writes,
+        view_marks: l.view_marks,
+    };
+    let vs = super::host::position_vs();
+    let triangle = [
+        -1.0, -1.0, 0.5, 1.0, //
+        -1.0, 3.0, 0.5, 1.0, //
+        3.0, -1.0, 0.5, 1.0,
+    ];
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let root = host.root_signature(&vs, &ps).expect("root signature");
+        let pso = host
+            .depth_tested_pipeline(&root, &vs.dxil, &ps.dxil, D3D12_COMPARISON_FUNC_LESS)
+            .unwrap_or_else(|e| panic!("{label}: pipeline refused: {e}"));
+        let roots = vec![
+            (
+                0,
+                Root::Constants(vec![0; vs.user_data_dwords().max(1) as usize]),
+            ),
+            (
+                1,
+                Root::Constants(vec![0; ps.user_data_dwords().max(1) as usize]),
+            ),
+        ];
+        host.draw_behind_depth(&root, &pso, &roots, &triangle, (8, 8), 1.0)
+            .unwrap_or_else(|e| panic!("{label}: draw failed: {e}"));
     }
 }
 
