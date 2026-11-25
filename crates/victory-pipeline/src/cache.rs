@@ -48,6 +48,15 @@ impl Cache {
 
     /// Returns the cached output for `input`, converting it first if needed.
     pub fn get_or_convert(&self, converter: &dyn Converter, input: &[u8]) -> Result<PathBuf> {
+        self.get_or_convert_with_publish(converter, input, |tmp, path| std::fs::rename(tmp, path))
+    }
+
+    fn get_or_convert_with_publish(
+        &self,
+        converter: &dyn Converter,
+        input: &[u8],
+        publish: impl FnOnce(&Path, &Path) -> io::Result<()>,
+    ) -> Result<PathBuf> {
         let key = CacheKey::new(converter, input);
         let path = self.path_for(&key);
         if path.is_file() {
@@ -63,11 +72,19 @@ impl Cache {
         let (tmp, mut file) = tempfile_in(dir)?;
         let written = file.write_all(&output);
         drop(file);
-        let published = written.and_then(|()| std::fs::rename(&tmp, &path));
-        if published.is_err() {
+        if let Err(err) = written {
             let _ = std::fs::remove_file(&tmp);
+            return Err(err.into());
         }
-        published?;
+        if let Err(err) = publish(&tmp, &path) {
+            let _ = std::fs::remove_file(&tmp);
+            // Content-addressed: if another worker published the same key
+            // while we were writing (on Windows, renaming over a file held
+            // open by a reader fails with a sharing/access error), use it.
+            if !path.is_file() {
+                return Err(err.into());
+            }
+        }
         Ok(path)
     }
 }
@@ -232,5 +249,122 @@ mod tests {
     fn refuses_cache_inside_repo() {
         let inside = Path::new(env!("CARGO_MANIFEST_DIR")).join("cache");
         assert!(Cache::open(inside).is_err());
+    }
+
+    #[test]
+    fn concurrent_publication_reuses_existing_entry_and_removes_staging() {
+        #[cfg(windows)]
+        use std::sync::Mutex;
+
+        /// Simulates a second worker publishing the target file while our
+        /// `convert` is in flight, and (on Windows) holding it open without
+        /// delete-share so `rename` fails with a sharing violation.
+        struct Racing {
+            target: PathBuf,
+            #[cfg(windows)]
+            held: Mutex<Option<std::fs::File>>,
+        }
+
+        impl Converter for Racing {
+            fn id(&self) -> &'static str {
+                "test.racing"
+            }
+            fn version(&self) -> u32 {
+                1
+            }
+            fn convert(&self, input: &[u8]) -> Result<Vec<u8>> {
+                let bytes = input.to_ascii_uppercase();
+                std::fs::create_dir_all(self.target.parent().unwrap())?;
+                std::fs::write(&self.target, &bytes)?;
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::OpenOptionsExt;
+                    // FILE_SHARE_READ (1) without FILE_SHARE_DELETE forces
+                    // `std::fs::rename` over `target` to fail on Windows.
+                    let reader = std::fs::OpenOptions::new()
+                        .read(true)
+                        .share_mode(1)
+                        .open(&self.target)?;
+                    *self.held.lock().unwrap() = Some(reader);
+                }
+                Ok(bytes)
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = Cache::open(tmp.path().join("cache")).unwrap();
+        let probe = Racing {
+            target: PathBuf::new(),
+            #[cfg(windows)]
+            held: Mutex::new(None),
+        };
+        let target = cache.path_for(&CacheKey::new(&probe, b"race"));
+        let conv = Racing {
+            target: target.clone(),
+            #[cfg(windows)]
+            held: Mutex::new(None),
+        };
+
+        #[cfg(windows)]
+        let got = {
+            let got = cache.get_or_convert(&conv, b"race").unwrap();
+            drop(conv.held.lock().unwrap().take());
+            got
+        };
+        #[cfg(not(windows))]
+        let got = cache
+            .get_or_convert_with_publish(&conv, b"race", |stage, dest| {
+                assert_eq!(dest, target);
+                assert_eq!(std::fs::read(stage).unwrap(), b"RACE");
+                assert!(dest.is_file());
+                Err(io::Error::from(io::ErrorKind::PermissionDenied))
+            })
+            .unwrap();
+        assert_eq!(got, target);
+        assert_eq!(std::fs::read(&got).unwrap(), b"RACE");
+        assert_eq!(
+            std::fs::read_dir(target.parent().unwrap()).unwrap().count(),
+            1,
+            "staging file should be removed"
+        );
+    }
+
+    #[test]
+    fn concurrent_threads_converting_same_key_all_succeed() {
+        use std::sync::{Arc, Barrier};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = Arc::new(Cache::open(tmp.path().join("cache")).unwrap());
+        let conv = Arc::new(Upper {
+            version: 1,
+            runs: AtomicUsize::new(0),
+        });
+        let threads = 8;
+        let barrier = Arc::new(Barrier::new(threads));
+
+        let handles: Vec<_> = (0..threads)
+            .map(|_| {
+                let cache = cache.clone();
+                let conv = conv.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let path = cache.get_or_convert(conv.as_ref(), b"shared").unwrap();
+                    assert_eq!(std::fs::read(&path).unwrap(), b"SHARED");
+                    path
+                })
+            })
+            .collect();
+
+        let paths: Vec<PathBuf> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        for p in &paths[1..] {
+            assert_eq!(p, &paths[0]);
+        }
+        assert_eq!(
+            std::fs::read_dir(paths[0].parent().unwrap())
+                .unwrap()
+                .count(),
+            1
+        );
     }
 }
