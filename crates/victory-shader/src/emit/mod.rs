@@ -696,6 +696,363 @@ mod tests {
         assert_ne!(features & 0x200, 0, "SFI0 {features:#x}: no StencilRef");
     }
 
+    /// Reads the `ShaderFlags` word (entry property tag 0) from `dx.entryPoints`
+    /// in a DXIL container emitted by [`bitcode::Module`].
+    fn module_shader_flags(dxil_container: &[u8]) -> u64 {
+        let host = Container::parse(dxil_container).unwrap();
+        let bitcode = &host.part(FourCC::DXIL).unwrap().data[24..];
+        assert_eq!(&bitcode[..4], b"BC\xc0\xde");
+        let words: Vec<u32> = bitcode[4..]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&c| u32::from_le_bytes(c))
+            .collect();
+        struct Reader<'a> {
+            words: &'a [u32],
+            pos: usize,
+        }
+        impl Reader<'_> {
+            fn read(&mut self, width: u32) -> u64 {
+                let mut out = 0u64;
+                for i in 0..width {
+                    let word = self.words[self.pos / 32];
+                    let bit = (word >> (self.pos % 32)) & 1;
+                    out |= u64::from(bit) << i;
+                    self.pos += 1;
+                }
+                out
+            }
+            fn vbr(&mut self, width: u32) -> u64 {
+                let mut out = 0u64;
+                let mut shift = 0u32;
+                let mask = (1u64 << (width - 1)) - 1;
+                loop {
+                    let chunk = self.read(width);
+                    out |= (chunk & mask) << shift;
+                    if chunk >> (width - 1) == 0 {
+                        return out;
+                    }
+                    shift += width - 1;
+                }
+            }
+            fn align32(&mut self) {
+                self.pos = (self.pos + 31) & !31;
+            }
+        }
+        enum Md {
+            Val(u64),
+            Node(Vec<u64>),
+            Other,
+        }
+        let mut r = Reader {
+            words: &words,
+            pos: 0,
+        };
+        let mut stack: Vec<(u64, u32)> = Vec::new();
+        let mut num_values = 0u64;
+        let mut consts = std::collections::HashMap::<u64, u64>::new();
+        let mut mds: Vec<Md> = Vec::new();
+        let mut last_name: Vec<u8> = Vec::new();
+        let mut entry_node = None;
+        let total_bits = words.len() * 32;
+        while r.pos < total_bits {
+            let width = stack.last().map_or(2, |b| b.1);
+            let id = r.read(width);
+            match id {
+                0 => {
+                    r.align32();
+                    stack.pop();
+                    if stack.is_empty() {
+                        break;
+                    }
+                }
+                1 => {
+                    let block = r.vbr(8);
+                    let new_width = r.vbr(4) as u32;
+                    r.align32();
+                    let len_words = r.read(32) as usize;
+                    if matches!(block, 8 | 11 | 15) {
+                        stack.push((block, new_width));
+                    } else {
+                        r.pos += len_words * 32;
+                    }
+                }
+                3 => {
+                    let code = r.vbr(6);
+                    let nops = r.vbr(6) as usize;
+                    let ops: Vec<u64> = (0..nops).map(|_| r.vbr(6)).collect();
+                    match stack.last().map(|b| b.0) {
+                        Some(8) if matches!(code, 7 | 8) => num_values += 1,
+                        Some(11) if code != 1 => {
+                            if code == 4 {
+                                let v = ops[0];
+                                let decoded = if v & 1 != 0 {
+                                    (v >> 1).wrapping_neg()
+                                } else {
+                                    v >> 1
+                                };
+                                consts.insert(num_values, decoded);
+                            }
+                            num_values += 1;
+                        }
+                        Some(15) => match code {
+                            1 => mds.push(Md::Other),
+                            2 => mds.push(Md::Val(ops[1])),
+                            3 => mds.push(Md::Node(ops)),
+                            4 => last_name = ops.iter().map(|&c| c as u8).collect(),
+                            10 if last_name == b"dx.entryPoints" => entry_node = Some(ops[0]),
+                            _ => {}
+                        },
+                        _ => {}
+                    }
+                }
+                other => panic!("unexpected bitstream entry id {other}"),
+            }
+        }
+        let Md::Node(entry) = &mds[entry_node.expect("dx.entryPoints") as usize] else {
+            panic!("dx.entryPoints[0] is not a node");
+        };
+        let props_id = entry[4];
+        if props_id == 0 {
+            return 0;
+        }
+        let Md::Node(props) = &mds[(props_id - 1) as usize] else {
+            panic!("entry properties is not a node");
+        };
+        for &[tag_md, val_md] in props.as_chunks::<2>().0 {
+            let Md::Val(tag_id) = mds[(tag_md - 1) as usize] else {
+                continue;
+            };
+            if consts.get(&tag_id) == Some(&0) {
+                let Md::Val(flags_id) = mds[(val_md - 1) as usize] else {
+                    panic!("shader flags property is not a value");
+                };
+                return consts[&flags_id];
+            }
+        }
+        0
+    }
+
+    /// A vertex (or mesh) program that declares a UAV — such as the
+    /// written-pages bitmap `cd94d35` emits when `Options::view_marks` is set
+    /// for a store through an unordered view — must declare
+    /// `UAVsAtEveryStage` (ShaderFlags bit 16) and the matching SFI0 feature
+    /// bit `0x4`. Compute and pixel programs must not set it.
+    #[test]
+    fn vertex_uav_writes_declare_uavs_at_every_stage() {
+        let store_uav = |stage: HwStage, tail: &[u32]| {
+            let base = stage.user_sgpr(0);
+            let mut w = vec![
+                0xBE80_0380u32 | (u32::from(base + 1) << 16), // s_mov_b32 s[base+1], 0
+                0xF408_0300 | (u32::from(base) >> 1),
+                0xFA00_0000, // s_load_dwordx4 s[12:15], s[base:base+1], null
+                0xBF8C_0000, // s_waitcnt all
+                0x7E00_02F2, // v_mov_b32 v0, 1.0
+                0xE070_0000,
+                0x8003_0000, // buffer_store_dword v0, off, s[12:15], 0
+            ];
+            w.extend_from_slice(tail);
+            w.push(0xBF81_0000); // s_endpgm
+            w
+        };
+        let translate_stage = |stage: HwStage, options: Options| {
+            let (words, io, osg1) = match stage {
+                HwStage::Vs => {
+                    let pos = SigElement {
+                        name: "SV_Position".into(),
+                        index: 0,
+                        kind: 3,
+                        comp: 9,
+                        interp: 0,
+                        row: Some(0),
+                        col: 0,
+                        cols: 4,
+                        usage: 0xF,
+                        half: false,
+                    };
+                    (
+                        store_uav(stage, &[0xF800_08CF, 0x0000_0000]), // exp pos0 v0..v0 done
+                        StageIo::Vs {
+                            inputs: vec![],
+                            outputs: vec![],
+                        },
+                        Some(container::signature(&[pos], false)),
+                    )
+                }
+                HwStage::Ps => {
+                    let target = SigElement {
+                        name: "SV_Target".into(),
+                        index: 0,
+                        kind: 16,
+                        comp: 9,
+                        interp: 0,
+                        row: Some(0),
+                        col: 0,
+                        cols: 4,
+                        usage: 0xF,
+                        half: false,
+                    };
+                    (
+                        store_uav(stage, &[0xF800_180F, 0x0000_0000]), // exp mrt0 v0..v0 done vm
+                        StageIo::Ps {
+                            inputs: vec![],
+                            input_addr: 0,
+                            db_shader_control: 0,
+                            patches: vec![],
+                        },
+                        Some(container::signature(&[target], false)),
+                    )
+                }
+                HwStage::Cs => (
+                    store_uav(stage, &[]),
+                    StageIo::Cs(ComputeIo {
+                        rsrc2: 1 << 1,
+                        threads: [1, 1, 1],
+                    }),
+                    None,
+                ),
+                HwStage::Ms => {
+                    let pos = SigElement {
+                        name: "SV_Position".into(),
+                        index: 0,
+                        kind: 3,
+                        comp: 9,
+                        interp: 0,
+                        row: Some(0),
+                        col: 0,
+                        cols: 4,
+                        usage: 0xF,
+                        half: false,
+                    };
+                    (
+                        store_uav(
+                            stage,
+                            &[
+                                0x7E02_02FF,
+                                TRIANGLE, // v_mov_b32 v1, TRIANGLE
+                                0xF800_0941,
+                                0x0000_0001, // exp prim v1, off, off, off done
+                                0xF800_08CF,
+                                0x0000_0000, // exp pos0 v0..v0 done
+                            ],
+                        ),
+                        StageIo::Ms(crate::native::MeshIo {
+                            outputs: vec![],
+                            clip_cntl: 0,
+                            threads: 32,
+                            max_vertices: 32,
+                            max_primitives: 32,
+                            topology: 2,
+                            lds_bytes: 0,
+                        }),
+                        Some(container::signature(&[pos], false)),
+                    )
+                }
+                _ => unreachable!(),
+            };
+            let native = NativeProgram {
+                stage,
+                wave64: false,
+                vgprs: 4,
+                layout: vec![crate::native::RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                }],
+                used: vec![crate::native::UsedResource {
+                    kind: crate::native::ResourceType::Uav,
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    lower_bound: 0,
+                    stride: 0,
+                    dwords: 4,
+                    user_data: 0,
+                    slot: 0,
+                }],
+                io,
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let parts: Vec<_> = osg1
+                .as_deref()
+                .map(|o| (FourCC::OSG1, o))
+                .into_iter()
+                .collect();
+            let bytes = crate::dxbc::build(&parts);
+            let c = Container::parse(&bytes).unwrap();
+            let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            let out = emit_with(&c, &native, &p, &st, &io, &res, options).unwrap();
+            #[cfg(windows)]
+            if let Ok(mut v) = super::validator::Validator::load(
+                super::validator::Validator::default_path().as_deref(),
+            ) {
+                v.validate(&mut out.dxil.clone()).unwrap();
+            }
+            let host = Container::parse(&out.dxil).unwrap();
+            let sfi0 = host.part(FourCC::SFI0).unwrap().data;
+            let features = u64::from_le_bytes(sfi0.try_into().unwrap());
+            let flags = module_shader_flags(&out.dxil);
+            (out, features, flags)
+        };
+
+        let marks = Options { view_marks: true };
+        for stage in [HwStage::Vs, HwStage::Ms] {
+            let (out, sfi0, flags) = translate_stage(stage, marks);
+            assert!(
+                out.view_marks,
+                "{stage:?} store must emit the view-mark UAV"
+            );
+            assert_ne!(
+                sfi0 & 0x4,
+                0,
+                "{stage:?} SFI0 {sfi0:#x}: missing UAVsAtEveryStage"
+            );
+            assert_ne!(
+                flags & shader::flags::UAVS_AT_EVERY_STAGE,
+                0,
+                "{stage:?} module flags {flags:#x}: missing UAVsAtEveryStage"
+            );
+        }
+
+        let (vs_no_marks, vs_no_marks_sfi0, vs_no_marks_flags) =
+            translate_stage(HwStage::Vs, Options::default());
+        assert!(!vs_no_marks.view_marks);
+        assert_eq!(
+            vs_no_marks_sfi0 & 0x4,
+            0,
+            "VS without declared UAVs must not set UAVsAtEveryStage in SFI0"
+        );
+        assert_eq!(
+            vs_no_marks_flags & shader::flags::UAVS_AT_EVERY_STAGE,
+            0,
+            "VS without declared UAVs must not set UAVsAtEveryStage in module flags"
+        );
+
+        for stage in [HwStage::Ps, HwStage::Cs] {
+            let (out, sfi0, flags) = translate_stage(stage, marks);
+            assert!(
+                out.view_marks,
+                "{stage:?} store must emit the view-mark UAV"
+            );
+            assert_eq!(
+                sfi0 & 0x4,
+                0,
+                "{stage:?} SFI0 {sfi0:#x}: must not set UAVsAtEveryStage"
+            );
+            assert_eq!(
+                flags & shader::flags::UAVS_AT_EVERY_STAGE,
+                0,
+                "{stage:?} module flags {flags:#x}: must not set UAVsAtEveryStage"
+            );
+        }
+    }
+
     #[test]
     fn immediate_sampler_slots_distinguish_comparison_uses() {
         let words = [
