@@ -1993,7 +1993,7 @@ impl HostList {
 }
 
 /// A submission's refreshes not done yet, merged per buffer copy into the
-/// range that covers them: done before a step that writes title memory or
+/// range union: done before a step that writes title memory or
 /// gives a range to shaders, and before the lists run.
 ///
 /// Also the textures brought up to date in the submission so far: most
@@ -2008,30 +2008,80 @@ impl HostList {
 /// GPU).
 #[derive(Default)]
 struct Batch {
-    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    refreshes: Vec<ShadowRefresh>,
     /// Where each copy's refresh is in `refreshes`, by copy.
     pending: std::collections::HashMap<usize, usize>,
-    /// The range of each copy brought up to date since the last title
-    /// write, by copy (held, so that its address names no other).
-    current: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    /// Each copy's exact refreshed ranges since the last title write. The
+    /// copy is kept so its address cannot be reused for a different copy.
+    current: std::collections::HashMap<usize, ShadowRefresh>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
 }
 
+type ShadowRefresh = (std::sync::Arc<crate::shadow::Shadow>, RefreshRanges);
+
+/// Most copies only request one range. Gather disjoint requests without
+/// allocating on the single-range path, then merge only touching ranges.
+enum RefreshRanges {
+    One((usize, usize)),
+    Many(Vec<(usize, usize)>),
+}
+
+impl RefreshRanges {
+    fn add(&mut self, range: (usize, usize)) {
+        match self {
+            Self::One((from, to)) if range.0 <= *to && *from <= range.1 => {
+                *from = (*from).min(range.0);
+                *to = (*to).max(range.1);
+            }
+            Self::One(previous) => *self = Self::Many(vec![*previous, range]),
+            Self::Many(ranges) => ranges.push(range),
+        }
+    }
+
+    fn merge(&mut self) {
+        if let Self::Many(ranges) = self {
+            ranges.sort_unstable();
+            ranges.dedup_by(|next, previous| {
+                if next.0 > previous.1 {
+                    return false;
+                }
+                previous.1 = previous.1.max(next.1);
+                true
+            });
+            if ranges.len() == 1 {
+                *self = Self::One(ranges[0]);
+            }
+        }
+    }
+
+    fn slices(&self) -> &[(usize, usize)] {
+        match self {
+            Self::One(range) => std::slice::from_ref(range),
+            Self::Many(ranges) => ranges,
+        }
+    }
+
+    /// The ranges are merged before recording them as current.
+    fn covers(&self, (from, to): (usize, usize)) -> bool {
+        let ranges = self.slices();
+        let end = ranges.partition_point(|&(start, _)| start <= from);
+        end != 0 && to <= ranges[end - 1].1
+    }
+}
+
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
-        let (key, end) = (std::sync::Arc::as_ptr(shadow) as usize, address + len);
-        if self.current.get(&key).is_some_and(|&(_, a, b)| a <= address && end <= b) {
+        let range = (address, address + len);
+        let key = std::sync::Arc::as_ptr(shadow) as usize;
+        if len == 0 || self.current.get(&key).is_some_and(|(_, ranges)| ranges.covers(range)) {
             return;
         }
         match self.pending.get(&key) {
-            Some(&i) => {
-                let (_, from, to) = &mut self.refreshes[i];
-                (*from, *to) = ((*from).min(address), (*to).max(end));
-            }
+            Some(&i) => self.refreshes[i].1.add(range),
             None => {
                 self.pending.insert(key, self.refreshes.len());
-                self.refreshes.push((shadow.clone(), address, end));
+                self.refreshes.push((shadow.clone(), RefreshRanges::One(range)));
             }
         }
     }
@@ -2056,23 +2106,31 @@ impl Batch {
         let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::FlushUs);
         self.pending.clear();
         let mut total = 0;
-        for (shadow, from, to) in self.refreshes.drain(..) {
-            let started = std::time::Instant::now();
-            let copied = shadow.update(from, to - from);
-            let us = started.elapsed().as_micros() as u64;
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::range(from, to - from, us, 0);
-            PREPARING[0].fetch_add(us, Ordering::Relaxed);
-            PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
-            total += copied;
-            // Kept: the union with what was current if they touch, else
-            // the larger.
+        use std::collections::hash_map::Entry;
+        for (shadow, mut ranges) in self.refreshes.drain(..) {
+            ranges.merge();
+            for &(from, to) in ranges.slices() {
+                let started = std::time::Instant::now();
+                let copied = shadow.update(from, to - from);
+                let us = started.elapsed().as_micros() as u64;
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::range(from, to - from, us, 0);
+                PREPARING[0].fetch_add(us, Ordering::Relaxed);
+                PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+                total += copied;
+            }
             let key = std::sync::Arc::as_ptr(&shadow) as usize;
-            let (_, a, b) = self.current.entry(key).or_insert((shadow, from, to));
-            if from <= *b && *a <= to {
-                (*a, *b) = ((*a).min(from), (*b).max(to));
-            } else if to - from > *b - *a {
-                (*a, *b) = (from, to);
+            match self.current.entry(key) {
+                Entry::Vacant(entry) => {
+                    entry.insert((shadow, ranges));
+                }
+                Entry::Occupied(mut entry) => {
+                    let current = &mut entry.get_mut().1;
+                    for &range in ranges.slices() {
+                        current.add(range);
+                    }
+                    current.merge();
+                }
             }
         }
         total
@@ -3085,6 +3143,225 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         crate::shadow::unregister(p, p as u64);
         drop(copy);
         crate::watch::tests::free(p);
+    }
+
+    /// Two requested ranges leave a dirty interior page available to its
+    /// own reader. The change journal must not consume it with the first two.
+    #[test]
+    fn disjoint_refreshes_leave_the_dirty_gap_for_its_reader() {
+        use crate::watch::PAGE;
+
+        let title = crate::watch::tests::pool(3);
+        let len = 3 * PAGE;
+        crate::shadow::register(title, title as u64, len as u64);
+        let Some(copy) = crate::shadow::find(title as u64, len as u64) else {
+            crate::shadow::unregister(title, title as u64);
+            crate::watch::tests::free(title);
+            assert!(std::env::var_os("VICTORY_TEST_SHADOW_DISJOINT_REQUIRE_GPU").is_none());
+            return;
+        };
+        let mut warm = Batch::default();
+        warm.add(&copy, title, len);
+        let warmed = warm.flush();
+        for (page, marker) in [11u8, 22, 33].into_iter().enumerate() {
+            // SAFETY: each address belongs to the test's guarded allocation.
+            unsafe { ((title + page * PAGE) as *mut u8).write_volatile(marker) };
+        }
+
+        let mut batch = Batch::default();
+        batch.add(&copy, title + 2 * PAGE, PAGE);
+        batch.add(&copy, title, PAGE);
+        batch.add(&copy, title + PAGE / 2, PAGE / 2);
+        let first_bytes = batch.flush();
+        let markers = [0, 1, 2].map(|page| copy.read_host((title + page * PAGE) as u64, 1)[0]);
+        // SAFETY: the test still owns the title allocation.
+        unsafe { ((title + 2 * PAGE) as *mut u8).write_volatile(44) };
+        batch.add(&copy, title + 2 * PAGE, PAGE);
+        let repeated_bytes = batch.flush();
+        batch.add(&copy, title + PAGE, PAGE);
+        let late_bytes = batch.flush();
+        let late_marker = copy.read_host((title + PAGE) as u64, 1)[0];
+        batch.title_written();
+        batch.add(&copy, title + 2 * PAGE, PAGE);
+        let next_phase_bytes = batch.flush();
+        let next_phase_marker = copy.read_host((title + 2 * PAGE) as u64, 1)[0];
+
+        // The temporary read batches hold copies of the backing while live.
+        drop((warm, batch));
+        crate::shadow::unregister(title, title as u64);
+        drop(copy);
+        crate::watch::tests::free(title);
+
+        eprintln!(
+            "disjoint refresh copied {first_bytes} then {late_bytes} bytes, markers {markers:?} then {late_marker}"
+        );
+        assert_eq!(warmed, len);
+        assert_eq!(first_bytes, 2 * PAGE);
+        assert_eq!(markers, [11, 0, 33]);
+        assert_eq!(repeated_bytes, 0);
+        assert_eq!(late_bytes, PAGE);
+        assert_eq!(late_marker, 22);
+        assert_eq!(next_phase_bytes, PAGE);
+        assert_eq!(next_phase_marker, 44);
+    }
+
+    #[test]
+    fn disjoint_refreshes_see_alias_writes_on_repeated_submissions() {
+        use crate::watch::{PAGE, tests::twin_views, title_memory_remapped};
+        use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
+
+        if crate::host::host().is_none() {
+            assert!(std::env::var_os("VICTORY_TEST_SHADOW_DISJOINT_REQUIRE_GPU").is_none());
+            return;
+        }
+        let len = 3 * PAGE;
+        let (title, alias) = twin_views(3);
+        crate::shadow::register(title, title as u64, len as u64);
+        crate::shadow::register(alias, alias as u64, len as u64);
+        let copy = crate::shadow::find(title as u64, len as u64).unwrap();
+        let other_copy = crate::shadow::find(alias as u64, len as u64).unwrap();
+        assert!(!std::sync::Arc::ptr_eq(&copy, &other_copy));
+        assert_eq!(copy.update(title, len), len);
+        assert_eq!(other_copy.update(alias, len), len);
+
+        let mut previous_gap = 0;
+        for value in [11u32, 21, 31] {
+            // SAFETY: both addresses are in our alias view, outside the gap.
+            unsafe {
+                (alias as *mut u32).write_volatile(value);
+                ((alias + 2 * PAGE) as *mut u32).write_volatile(value + 2);
+            }
+            let mut batch = Batch::default();
+            batch.add(&copy, title, PAGE);
+            batch.add(&copy, title + 2 * PAGE, PAGE);
+            let gate = std::sync::Barrier::new(2);
+            std::thread::scope(|scope| {
+                let writer = scope.spawn(|| {
+                    gate.wait();
+                    // SAFETY: the gap is outside both active refresh ranges.
+                    unsafe { ((alias + PAGE) as *mut u32).write_volatile(value + 1) };
+                });
+                gate.wait();
+                let bytes = batch.flush();
+                writer.join().unwrap();
+                assert_eq!(bytes, 2 * PAGE);
+            });
+            let markers = |s: &crate::shadow::Shadow, base| {
+                [0, 1, 2].map(|page| s.read_host((base + page * PAGE) as u64, 1)[0])
+            };
+            assert_eq!(markers(&copy, title), [value, previous_gap, value + 2]);
+            assert_eq!(other_copy.update(alias, len), len, "the other backing sees its own dirt");
+            assert_eq!(markers(&other_copy, alias), [value, value + 1, value + 2]);
+            batch.add(&copy, title + PAGE, PAGE);
+            assert_eq!(batch.flush(), PAGE);
+            assert_eq!(markers(&copy, title), [value, value + 1, value + 2]);
+            previous_gap = value + 1;
+        }
+
+        crate::shadow::unregister(title, title as u64);
+        crate::shadow::unregister(alias, alias as u64);
+        drop((copy, other_copy));
+        for address in [title, alias] {
+            // SAFETY: both views were made by this test and are no longer read.
+            assert_ne!(unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: address as *mut _ }) }, 0);
+            title_memory_remapped(address, len);
+        }
+    }
+
+    #[test]
+    fn disjoint_refreshes_handle_mapping_invalidation_between_submissions() {
+        use crate::watch::{PAGE, tests::{free, pool}, title_memory_remapped};
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_DECOMMIT, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+
+        if crate::host::host().is_none() {
+            assert!(std::env::var_os("VICTORY_TEST_SHADOW_DISJOINT_REQUIRE_GPU").is_none());
+            return;
+        }
+        let title = pool(3);
+        let middle = title + PAGE;
+        let len = 3 * PAGE;
+        crate::shadow::register(title, title as u64, len as u64);
+        let copy = crate::shadow::find(title as u64, len as u64).unwrap();
+        // SAFETY: the committed middle page is owned by the test.
+        unsafe { (middle as *mut u8).write_volatile(12) };
+        assert_eq!(copy.update(title, len), len);
+        assert_eq!(copy.read_host(middle as u64, 1)[0], 12);
+        // SAFETY: the middle page is committed inside our reservation.
+        assert_ne!(unsafe { VirtualFree(middle as *mut _, PAGE, MEM_DECOMMIT) }, 0);
+        title_memory_remapped(middle, PAGE);
+
+        let mut batch = Batch::default();
+        batch.add(&copy, title, PAGE);
+        batch.add(&copy, title + 2 * PAGE, PAGE);
+        assert_eq!(batch.flush(), 0);
+        assert_eq!(copy.read_host(middle as u64, 1)[0], 12);
+        batch.add(&copy, middle, PAGE);
+        assert_eq!(batch.flush(), PAGE);
+        assert_eq!(copy.read_host(middle as u64, 1)[0], 0);
+        drop(batch);
+
+        // SAFETY: recommit only the missing region of our live reservation.
+        assert_eq!(unsafe { VirtualAlloc(middle as *mut _, PAGE, MEM_COMMIT, PAGE_READWRITE) } as usize, middle);
+        title_memory_remapped(middle, PAGE);
+        // SAFETY: the recommitted page is writable and stays live below.
+        unsafe { (middle as *mut u8).write_volatile(34) };
+        let mut batch = Batch::default();
+        batch.add(&copy, middle, PAGE);
+        assert_eq!(batch.flush(), PAGE);
+        assert_eq!(copy.read_host(middle as u64, 1)[0], 34);
+
+        drop(batch);
+        crate::shadow::unregister(title, title as u64);
+        drop(copy);
+        free(title);
+    }
+
+    #[test]
+    fn disjoint_partial_refreshes_preserve_pending_gpu_writes() {
+        use crate::watch::{PAGE, tests::{free, pool}};
+
+        let Some(host) = crate::host::host() else {
+            assert!(std::env::var_os("VICTORY_TEST_SHADOW_DISJOINT_REQUIRE_GPU").is_none());
+            return;
+        };
+        let title = pool(1);
+        crate::shadow::register(title, title as u64, PAGE as u64);
+        let copy = crate::shadow::find(title as u64, PAGE as u64).unwrap();
+        assert_eq!(copy.update(title, PAGE), PAGE);
+        let busy = title + 32;
+        copy.writing(busy, 4);
+        for (offset, value) in [(4, 11u8), (16, 22), (32, 33), (40, 44)] {
+            // SAFETY: every marker belongs to the test's live title page.
+            unsafe { ((title + offset) as *mut u8).write_volatile(value) };
+        }
+        let mut batch = Batch::default();
+        batch.add(&copy, title + 4, 4);
+        batch.add(&copy, busy, 12);
+        assert_eq!(batch.flush(), 12, "the pending dword and the gap stay untouched");
+        let markers = || [4, 16, 32, 40].map(|offset| copy.read_host((title + offset) as u64, 1)[0]);
+        assert_eq!(markers(), [11, 0, 0, 44]);
+
+        let (upload, data) = host.upload_buffer(4).unwrap();
+        let writer = host.new_list().unwrap();
+        // SAFETY: both buffers live through the synchronous submission; the
+        // copy targets the pending dword, outside the CPU refreshes above.
+        unsafe {
+            data.cast::<u32>().write(55);
+            writer.list.CopyBufferRegion(&copy.buffer, 32, &upload, 0, 4);
+        }
+        writer.close();
+        host.execute(&[&writer]);
+        assert_eq!(copy.copy_back(busy, 4), 4);
+        // SAFETY: the copy-back completed and the test owns this page.
+        assert_eq!(unsafe { (busy as *const u8).read_volatile() }, 55);
+
+        batch.add(&copy, title + 16, 4);
+        assert_eq!(batch.flush(), 4, "the unobserved partial page stays dirty");
+        assert_eq!(markers(), [11, 22, 55, 44]);
+        drop(batch);
+        crate::shadow::unregister(title, title as u64);
+        drop(copy);
+        free(title);
     }
 
     /// The hashing a submission does for textures in physical-page memory,

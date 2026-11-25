@@ -725,6 +725,7 @@ pub(crate) mod tests {
     /// title's pool view and tiled heap show the same physical pages),
     /// reported as the runtime does when it maps them.
     pub(crate) fn twin_views(pages: usize) -> (usize, usize) {
+        use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile};
         let len = pages * PAGE;
         // SAFETY: a pagefile section mapped read-write twice; the test
@@ -739,10 +740,12 @@ pub(crate) mod tests {
                 std::ptr::null(),
             );
             assert!(!section.is_null());
-            (
+            let views = (
                 MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, len).Value as usize,
                 MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, len).Value as usize,
-            )
+            );
+            CloseHandle(section);
+            views
         };
         assert!(a != 0 && b != 0);
         for k in (0..len).step_by(PAGE) {
