@@ -24,6 +24,45 @@ use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 use crate::host::{HostList, host};
 use crate::watch::PAGE;
 
+fn merge_writeback(title: &mut [u8], host: &mut [u8], old: &[u8]) -> bool {
+    let mut changed = 0;
+    for ((title_byte, host_byte), old_byte) in title.iter_mut().zip(host).zip(old) {
+        let mask = 0u8.wrapping_sub(u8::from(*host_byte != *old_byte));
+        let delta = (*title_byte ^ *host_byte) & mask;
+        *title_byte ^= delta;
+        *host_byte = *title_byte;
+        changed |= delta;
+    }
+    changed != 0
+}
+
+#[test]
+fn writeback_merge_matches_bytewise_oracle() {
+    for len in [0, 1, 63, 64, 65, 193, 65_536] {
+        let old = vec![0x11; len];
+        for stride in [1, 5, 67, len + 1] {
+            let mut title = old.clone();
+            let mut host = old.clone();
+            for index in (0..len).step_by(3) {
+                title[index] = 0x22;
+            }
+            for index in (0..len).step_by(stride) {
+                host[index] = if index % 2 == 0 { 0x22 } else { 0x33 };
+            }
+            let expected: Vec<_> = host
+                .iter()
+                .zip(&old)
+                .zip(&title)
+                .map(|((&gpu, &previous), &cpu)| if gpu == previous { cpu } else { gpu })
+                .collect();
+            let changed = expected != title;
+            assert_eq!(merge_writeback(&mut title, &mut host, &old), changed);
+            assert_eq!(title, expected);
+            assert_eq!(host, expected);
+        }
+    }
+}
+
 /// A title buffer's host copy.
 pub(crate) struct Shadow {
     pub(crate) buffer: ID3D12Resource,
@@ -380,15 +419,7 @@ impl Shadow {
                 if host != old && crate::host::read_into((start + at) as *const u8, title) {
                     // Title memory with the GPU's bytes put in; the copy
                     // takes the title's bytes in turn.
-                    let mut changed = false;
-                    for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
-                        if *h != *o && *t != *h {
-                            *t = *h;
-                            changed = true;
-                        }
-                        *h = *t;
-                    }
-                    if changed {
+                    if merge_writeback(title, host, old) {
                         let _writing = crate::watch::writing(start + at, n);
                         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
                         written += n;
@@ -463,15 +494,7 @@ impl Shadow {
             None => (*host != title[..]).then_some(host.as_ptr()),
             Some(before) => {
                 let before = &before[from - page..to - page];
-                let mut changed = false;
-                for ((t, h), b) in title.iter_mut().zip(host.iter_mut()).zip(before) {
-                    if *h != *b && *t != *h {
-                        *t = *h;
-                        changed = true;
-                    }
-                    *h = *t;
-                }
-                changed.then_some(title.as_ptr())
+                merge_writeback(&mut title, host, before).then_some(title.as_ptr())
             }
         };
         if let Some(bytes) = written {
