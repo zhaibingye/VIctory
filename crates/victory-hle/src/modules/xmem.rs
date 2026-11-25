@@ -221,14 +221,24 @@ pub extern "system" fn XMemVirtualQuery(
 // from 2), then the memory type, then bit 33: a 32-bit address.
 const ALIGNMENT_SHIFT: u64 = 24;
 const ALLOC_32BIT: u64 = 1 << 33;
-/// Our block header: the block's size and alignment, just below the
-/// pointer handed out.
+/// Our block header: the block's size and the pointer's offset in it,
+/// just below the pointer handed out.
 const HEADER: usize = 2 * size_of::<usize>();
+/// The alignment the host heap gives without padding of its own.
+const HEAP_ALIGN: usize = 16;
 
-fn layout(size: usize, attributes: u64) -> Option<Layout> {
-    // An alignment of at least 16 leaves room for the header.
+/// The alignment `attributes` ask for (at least 16, which leaves room for
+/// the header), and the host block for `size` bytes at it: room for the
+/// header and the alignment, at the host heap's own alignment. (A layout
+/// at the asked alignment pays it twice: the host allocator pads an
+/// over-aligned block by the alignment again, so a 64 KiB-aligned block
+/// cost 192 KiB.)
+fn layout(size: usize, attributes: u64) -> Option<(usize, Layout)> {
     let align = 1usize << (attributes >> ALIGNMENT_SHIFT & 0x1f).max(4);
-    Layout::from_size_align(size.checked_add(align)?, align).ok()
+    // From a 16-aligned block, the header and the step up to `align` take
+    // at most `align` bytes (`HEADER` is 16).
+    let layout = Layout::from_size_align(size.checked_add(align)?, HEAP_ALIGN).ok()?;
+    Some((align, layout))
 }
 
 type AllocRoutine = extern "system" fn(usize, u64) -> *mut c_void;
@@ -300,7 +310,7 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
             PAGE_READWRITE,
         );
     }
-    let Some(layout) = layout(size, attributes) else {
+    let Some((align, layout)) = layout(size, attributes) else {
         return std::ptr::null_mut();
     };
     // shortcut: the host heap's addresses lie above 2^40, unlike the
@@ -313,13 +323,14 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
         tracing::warn!(size, "XMemAllocDefault: the host heap is out of memory");
         return block.cast();
     }
-    // SAFETY: the block holds the alignment (at least the header) and then
-    // `size` bytes.
+    let offset = (block as usize + HEADER).next_multiple_of(align) - block as usize;
+    // SAFETY: the block holds the header, the step to the alignment (at
+    // most `align` bytes together) and then `size` bytes.
     unsafe {
-        let user = block.add(layout.align());
+        let user = block.add(offset);
         user.sub(HEADER)
             .cast::<[usize; 2]>()
-            .write([layout.size(), layout.align()]);
+            .write([layout.size(), offset]);
         user.cast()
     }
 }
@@ -337,10 +348,10 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
             return;
         }
         let user = address.cast::<u8>();
-        let [size, align] = user.sub(HEADER).cast::<[usize; 2]>().read();
+        let [size, offset] = user.sub(HEADER).cast::<[usize; 2]>().read();
         dealloc(
-            user.sub(align),
-            Layout::from_size_align_unchecked(size, align),
+            user.sub(offset),
+            Layout::from_size_align_unchecked(size, HEAP_ALIGN),
         );
     }
 }
@@ -1054,6 +1065,27 @@ mod tests {
         let p = XMemAlloc(4096, ALLOC_32BIT);
         assert!(!p.is_null() && (p as usize) < 1 << 32);
         XMemFree(p, ALLOC_32BIT);
+    }
+
+    /// An aligned block costs the host heap its size and the alignment
+    /// once: the block is the heap's own (16-aligned), not one the host
+    /// allocator padded for the alignment again.
+    #[test]
+    fn aligned_blocks_are_padded_once() {
+        use windows_sys::Win32::System::Memory::{GetProcessHeap, HeapSize};
+        for (field, align) in [(0, 16usize), (0xc, 4096), (0x10, 64 * 1024)] {
+            let attributes = field << ALIGNMENT_SHIFT;
+            let p = XMemAllocDefault(1000, attributes);
+            assert_eq!(p as usize % align, 0);
+            // SAFETY: (both) the header below the block we just made.
+            let [size, offset] = unsafe { p.cast::<u8>().sub(HEADER).cast::<[usize; 2]>().read() };
+            assert_eq!(size, 1000 + align);
+            assert!(HEADER <= offset && offset <= align, "{offset}");
+            // SAFETY: the host block, a block of the process heap.
+            let heap = unsafe { HeapSize(GetProcessHeap(), 0, p.cast::<u8>().sub(offset).cast()) };
+            assert_eq!(heap, 1000 + align, "align {align}");
+            XMemFreeDefault(p, attributes);
+        }
     }
 
     #[test]
