@@ -226,10 +226,11 @@ fn once(console: u32, view: u32, plane: u32, what: &str) {
 
 /// An unordered access view at `at` of `resource`, a depth texture whose
 /// host copy is `copy`, made on its twin's plane the title's view names
-/// (`words`: the view description), in a format of that plane's family
-/// (the title's own if it is one, else the plane's integer or normalised
-/// one, as the title's format is). The twin's plane texture, which the
-/// slot then views.
+/// (`words`: the view description, or `None` for the resource's default
+/// mip-0 plane-0 view), in a UAV-capable format of that plane's family (the
+/// title's own if it is one, else the plane's integer or normalised/float
+/// one, as the title's format is). The twin's plane texture, which the slot
+/// then views.
 pub(crate) fn uav(
     resource: This,
     copy: &Arc<HostTexture>,
@@ -238,28 +239,80 @@ pub(crate) fn uav(
 ) -> Option<ID3D12Resource> {
     let console = crate::resource::title_format(resource)?;
     let twin = copy.twin.get_or_init(|| make(console, &copy.texture)).as_ref()?;
-    let mut words = *words?;
+    let mut words = match words {
+        Some(&w) => w,
+        // SAFETY: a live resource.
+        None => default_uav_words(console, &unsafe { copy.texture.GetDesc() })?,
+    };
+    const TEXTURE_1D: u32 = 2;
+    const TEXTURE_1D_ARRAY: u32 = 3;
     const TEXTURE_2D: u32 = 4;
     const TEXTURE_2D_ARRAY: u32 = 5;
     // The plane: last of the 2D view's fields (mip, plane; mip, first
-    // slice, slices, plane).
+    // slice, slices, plane); 1D views have only plane 0.
     let plane_word = match words[1] {
-        TEXTURE_2D => 3,
-        TEXTURE_2D_ARRAY => 5,
+        TEXTURE_1D | TEXTURE_1D_ARRAY => None,
+        TEXTURE_2D => Some(3),
+        TEXTURE_2D_ARRAY => Some(5),
         other => {
             once(console, words[0], other, "an unordered view of a depth texture of this dimension: not made");
             return None;
         }
     };
-    let plane = words[plane_word] as usize;
+    let plane = plane_word.map_or(0, |w| words[w] as usize);
     let Some(texture) = twin.planes.get(plane) else {
         once(console, words[0], plane as u32, "an unordered view of a depth plane the twin does not have: not made");
         return None;
     };
     // SAFETY: a live resource.
     let own = unsafe { texture.texture.GetDesc() }.Format.0 as u32;
-    let view = crate::resource::pc_format(words[0]);
-    let format = if crate::resource::family(view) == own {
+    let requested = words[0];
+    let format = uav_format(own, requested, console);
+    // Like ordinary texture UAVs, a twin needs device support for the
+    // resolved concrete format, not merely a match in its DXGI family.
+    if !crate::descriptor::host::typed_store(format) {
+        once(console, format, plane as u32, "an unordered view of a depth twin in a format the host cannot store");
+        return None;
+    }
+    once(console, requested, plane as u32, "an unordered view of a depth texture, made on its writable twin");
+    words[0] = format;
+    if let Some(w) = plane_word {
+        words[w] = 0;
+    }
+    // SAFETY: 40 bytes in the host's layout.
+    let desc = unsafe { std::ptr::from_ref(&words).cast::<D3D12_UNORDERED_ACCESS_VIEW_DESC>().read_unaligned() };
+    // SAFETY: a live texture and a slot of our heap.
+    unsafe { host()?.device.CreateUnorderedAccessView(&texture.texture, None, Some(&desc), at) };
+    Some(texture.texture.clone())
+}
+
+/// Default `D3D12_UNORDERED_ACCESS_VIEW_DESC` words when the caller passes a
+/// null description: mip 0, plane 0, and every slice of an array texture.
+fn default_uav_words(console: u32, desc: &D3D12_RESOURCE_DESC) -> Option<[u32; 10]> {
+    let slices = u32::from(desc.DepthOrArraySize);
+    let (dim, array) = match desc.Dimension {
+        D3D12_RESOURCE_DIMENSION_TEXTURE1D if slices > 1 => (3, slices),
+        D3D12_RESOURCE_DIMENSION_TEXTURE1D => (2, 0),
+        D3D12_RESOURCE_DIMENSION_TEXTURE2D if slices > 1 => (5, slices),
+        D3D12_RESOURCE_DIMENSION_TEXTURE2D => (4, 0),
+        _ => {
+            once(console, 0, desc.Dimension.0 as u32, "a default unordered view of a depth texture of this dimension: not made");
+            return None;
+        }
+    };
+    Some([console, dim, 0, 0, array, 0, 0, 0, 0, 0])
+}
+
+/// Picks a concrete UAV-capable host format in `own`'s family (`R16_TYPELESS`,
+/// `R32_TYPELESS`, or `R8_TYPELESS`). Typeless (`39`, `53`, `60`) and depth
+/// (`40` `D32_FLOAT`, `55` `D16_UNORM`) members share `own`'s family but are
+/// rejected by D3D12 `CreateUnorderedAccessView` (removing the device), so
+/// they fall back to the plane's colour/integer format alongside cross-family
+/// and `DXGI_FORMAT_UNKNOWN` (`0`) views.
+fn uav_format(own: u32, raw_view: u32, console: u32) -> u32 {
+    let raw = if raw_view == 0 { console } else { raw_view };
+    let view = crate::resource::pc_format(raw);
+    if crate::resource::family(view) == own && !matches!(view, 39 | 40 | 53 | 55 | 60) {
         view
     } else {
         // R16_TYPELESS: unorm or uint; R32_TYPELESS: float or uint; R8: uint.
@@ -270,20 +323,15 @@ pub(crate) fn uav(
             (39, true) => 42,
             _ => 62,
         }
-    };
-    once(console, words[0], plane as u32, "an unordered view of a depth texture, made on its writable twin");
-    words[0] = format;
-    words[plane_word] = 0;
-    // SAFETY: 40 bytes in the host's layout.
-    let desc = unsafe { std::ptr::from_ref(&words).cast::<D3D12_UNORDERED_ACCESS_VIEW_DESC>().read_unaligned() };
-    // SAFETY: a live texture and a slot of our heap.
-    unsafe { host()?.device.CreateUnorderedAccessView(&texture.texture, None, Some(&desc), at) };
-    Some(texture.texture.clone())
+    }
 }
 
-/// Whether a format holds integers (`_UINT`, `_SINT`).
+/// Whether a format holds integers (`_UINT`, `_SINT`, or planar stencil).
 fn integer(format: u32) -> bool {
-    matches!(format, 3 | 4 | 7 | 8 | 12 | 14 | 17 | 18 | 25 | 30 | 32 | 36 | 38 | 42 | 43 | 50 | 52 | 57 | 59 | 62 | 64)
+    matches!(
+        format,
+        3 | 4 | 7 | 8 | 12 | 14 | 17 | 18 | 22 | 25 | 30 | 32 | 36 | 38 | 42 | 43 | 47 | 50 | 52 | 57 | 59 | 62 | 64
+    )
 }
 
 /// Before a use in `list` of the depth texture `depth` (with `twin`) in
@@ -572,5 +620,267 @@ mod tests {
         assert_eq!(again(DEPTH, &mut last, DEPTH, false), None);
         assert_eq!(again(DEPTH, &mut last, TWIN, true), Some(false));
         assert_eq!(last, Some(TWIN));
+    }
+
+    #[test]
+    fn uav_formats_and_default_words_stay_uav_capable() {
+        // Depth and typeless members of the twin's own family map to concrete
+        // UAV-capable formats instead of reaching CreateUnorderedAccessView.
+        assert_eq!(uav_format(39, 40, 40), 41); // D32_FLOAT -> R32_FLOAT
+        assert_eq!(uav_format(39, 39, 39), 41); // R32_TYPELESS -> R32_FLOAT
+        assert_eq!(uav_format(39, 0, 40), 41);  // UNKNOWN on D32_FLOAT -> R32_FLOAT
+        assert_eq!(uav_format(39, 42, 40), 42); // R32_UINT preserved
+        assert_eq!(uav_format(39, 43, 40), 43); // R32_SINT preserved
+        assert_eq!(uav_format(53, 55, 55), 56); // D16_UNORM -> R16_UNORM
+        assert_eq!(uav_format(53, 53, 53), 56); // R16_TYPELESS -> R16_UNORM
+        assert_eq!(uav_format(53, 0, 118), 56); // UNKNOWN on console D16S8 -> R16_UNORM
+        assert_eq!(uav_format(53, 54, 55), 54); // R16_FLOAT preserved
+        assert_eq!(uav_format(53, 57, 55), 57); // R16_UINT preserved
+        assert_eq!(uav_format(60, 60, 20), 62); // R8_TYPELESS -> R8_UINT
+        assert_eq!(uav_format(60, 22, 20), 62); // X32_TYPELESS_G8X24_UINT -> R8_UINT
+        assert_eq!(uav_format(60, 120, 118), 62); // console X16_TYPELESS_G8_UINT -> R8_UINT
+        assert_eq!(uav_format(60, 61, 20), 61); // R8_UNORM preserved
+
+        let d = |dimension, depth_or_array_size| D3D12_RESOURCE_DESC {
+            Dimension: dimension,
+            DepthOrArraySize: depth_or_array_size,
+            ..Default::default()
+        };
+        assert_eq!(
+            default_uav_words(55, &d(D3D12_RESOURCE_DIMENSION_TEXTURE1D, 1)),
+            Some([55, 2, 0, 0, 0, 0, 0, 0, 0, 0])
+        );
+        assert_eq!(
+            default_uav_words(55, &d(D3D12_RESOURCE_DIMENSION_TEXTURE1D, 4)),
+            Some([55, 3, 0, 0, 4, 0, 0, 0, 0, 0])
+        );
+        assert_eq!(
+            default_uav_words(40, &d(D3D12_RESOURCE_DIMENSION_TEXTURE2D, 1)),
+            Some([40, 4, 0, 0, 0, 0, 0, 0, 0, 0])
+        );
+        assert_eq!(
+            default_uav_words(40, &d(D3D12_RESOURCE_DIMENSION_TEXTURE2D, 3)),
+            Some([40, 5, 0, 0, 3, 0, 0, 0, 0, 0])
+        );
+        assert_eq!(
+            default_uav_words(40, &d(D3D12_RESOURCE_DIMENSION_TEXTURE3D, 2)),
+            None
+        );
+    }
+
+    #[test]
+    fn depth_typed_and_default_uavs_write_through_the_twin() {
+        let Some(host) = host() else { return };
+        let iid = crate::object::guid(
+            0x696442be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+        #[repr(C, align(8))]
+        struct Aligned([u32; 14]);
+        let make_depth = |dim: u32, w: u32, h: u32, slices: u16, format: u32| -> This {
+            let layout = std::alloc::Layout::from_size_align(1 << 20, 65536).unwrap();
+            // SAFETY: non-zero aligned allocation; leaked as title memory in tests.
+            let address = unsafe { std::alloc::alloc_zeroed(layout) as u64 };
+            let words = Aligned([
+                dim,
+                0,
+                0,
+                0,
+                w,
+                0,
+                h,
+                u32::from(slices) | 1 << 16,
+                format,
+                1,
+                0,
+                0,
+                2,
+                0,
+            ]);
+            let mut out = std::ptr::null();
+            let hr = crate::resource::create_at_address(
+                std::ptr::null(),
+                address,
+                words.0.as_ptr().cast(),
+                0,
+                std::ptr::null(),
+                &iid,
+                &mut out,
+            );
+            assert_eq!(hr, crate::object::S_OK);
+            out
+        };
+
+        let d32 = make_depth(3, 8, 8, 1, 40);
+        let d16_arr = make_depth(3, 8, 8, 2, 55);
+        let d16_1d = make_depth(2, 8, 1, 1, 55);
+        let copy32 = crate::resource::host_copy(d32).unwrap();
+        let copy16 = crate::resource::host_copy(d16_arr).unwrap();
+        let copy1d = crate::resource::host_copy(d16_1d).unwrap();
+
+        // SAFETY: plain shader-visible heap creation and handle queries.
+        let (heap, step) = unsafe {
+            let heap: ID3D12DescriptorHeap = host
+                .device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: 5,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })
+                .unwrap();
+            let step = host
+                .device
+                .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            (heap, step)
+        };
+        let slot = |i: u32| {
+            // SAFETY: a live heap.
+            let mut h = unsafe { heap.GetCPUDescriptorHandleForHeapStart() };
+            h.ptr += (i * step) as usize;
+            h
+        };
+
+        // Explicit D32_FLOAT (40), R32_TYPELESS (39), DXGI_FORMAT_UNKNOWN (0),
+        // a null-pDesc view of a 2-slice D16_UNORM array, and a 1D D16_UNORM view.
+        assert!(uav(d32, &copy32, Some(&[40, 4, 0, 0, 0, 0, 0, 0, 0, 0]), slot(0)).is_some());
+        assert!(uav(d16_arr, &copy16, None, slot(1)).is_some());
+        assert!(uav(d32, &copy32, Some(&[39, 4, 0, 0, 0, 0, 0, 0, 0, 0]), slot(2)).is_some());
+        assert!(uav(d32, &copy32, Some(&[0, 4, 0, 0, 0, 0, 0, 0, 0, 0]), slot(3)).is_some());
+        assert!(uav(d16_1d, &copy1d, Some(&[55, 2, 0, 0, 0, 0, 0, 0, 0, 0]), slot(4)).is_some());
+        // SAFETY: plain device health query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+
+        let cs = r#"
+#define RS "DescriptorTable(UAV(u0, numDescriptors=2))"
+RWTexture2D<float> out32 : register(u0);
+RWTexture2DArray<float> out16 : register(u1);
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    out32[id.xy] = 0.25 + 0.01 * id.x;
+    out16[uint3(id.xy, 0)] = 0.25;
+    out16[uint3(id.xy, 1)] = 0.75;
+}
+"#;
+        let (mut code, mut errors): (Option<ID3DBlob>, Option<ID3DBlob>) = (None, None);
+        // SAFETY: source and entry names outlive D3DCompile.
+        unsafe {
+            D3DCompile(
+                cs.as_ptr().cast(),
+                cs.len(),
+                s!("twin_uav_test"),
+                None,
+                None,
+                s!("main"),
+                s!("cs_5_1"),
+                0,
+                0,
+                &mut code,
+                Some(&mut errors),
+            )
+            .unwrap();
+        }
+        let code = code.unwrap();
+        // SAFETY: compiled shader blob holds a serialized root signature.
+        let (root, pso) = unsafe {
+            let bytes = std::slice::from_raw_parts(
+                code.GetBufferPointer().cast::<u8>(),
+                code.GetBufferSize(),
+            );
+            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, bytes).unwrap();
+            let pso: ID3D12PipelineState = host
+                .device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: bytes.as_ptr().cast(),
+                        BytecodeLength: bytes.len(),
+                    },
+                    ..Default::default()
+                })
+                .unwrap();
+            (root, pso)
+        };
+
+        let list = host.new_list().unwrap();
+        assert!(route(&list, &copy32, copy32.twin.get().unwrap().as_ref().unwrap(), UNORDERED_ACCESS));
+        assert!(route(&list, &copy16, copy16.twin.get().unwrap().as_ref().unwrap(), UNORDERED_ACCESS));
+        // SAFETY: open list, live heap, root signature, and pipeline.
+        unsafe {
+            list.list.SetDescriptorHeaps(&[Some(heap.clone())]);
+            list.list.SetComputeRootSignature(&root);
+            list.list.SetPipelineState(&pso);
+            list.list
+                .SetComputeRootDescriptorTable(0, heap.GetGPUDescriptorHandleForHeapStart());
+            list.list.Dispatch(1, 1, 1);
+        }
+        // Transition both depth textures to COPY_SOURCE: `route` copies each
+        // twin's unordered writes into its depth texture first.
+        crate::list::ensure_state(&list, d32, COPY_SOURCE);
+        crate::list::ensure_state(&list, d16_arr, COPY_SOURCE);
+
+        let mut fp32 = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+        let mut fp16 = [D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); 2];
+        let (mut end32, mut span16) = (0u64, 0u64);
+        // SAFETY: live resources and sized footprint outputs.
+        let base16 = unsafe {
+            let d = copy32.texture.GetDesc();
+            host.device
+                .GetCopyableFootprints(&d, 0, 1, 0, Some(&mut fp32), None, None, Some(&mut end32));
+            let base16 = end32.next_multiple_of(512);
+            let d = copy16.texture.GetDesc();
+            host.device.GetCopyableFootprints(
+                &d,
+                0,
+                2,
+                base16,
+                Some(fp16.as_mut_ptr()),
+                None,
+                None,
+                Some(&mut span16),
+            );
+            base16
+        };
+        let (readback, ptr) = host.shared_buffer(base16 + span16).unwrap();
+        let sub = |r: &ID3D12Resource, i: u32| D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: borrowed pointer for CopyTextureRegion.
+            pResource: unsafe { std::mem::transmute_copy(r) },
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: i },
+        };
+        let placed = |fp: D3D12_PLACED_SUBRESOURCE_FOOTPRINT| D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: borrowed pointer for CopyTextureRegion.
+            pResource: unsafe { std::mem::transmute_copy(&readback) },
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: fp },
+        };
+        // SAFETY: open list; depth textures in COPY_SOURCE, readback buffer writable.
+        unsafe {
+            list.list
+                .CopyTextureRegion(&placed(fp32), 0, 0, 0, &sub(&copy32.texture, 0), None);
+            list.list
+                .CopyTextureRegion(&placed(fp16[0]), 0, 0, 0, &sub(&copy16.texture, 0), None);
+            list.list
+                .CopyTextureRegion(&placed(fp16[1]), 0, 0, 0, &sub(&copy16.texture, 1), None);
+        }
+        list.close();
+        host.execute(&[&list]);
+
+        // SAFETY: GPU work waited on in `execute`; offsets lie inside `readback`.
+        unsafe {
+            for x in [0usize, 3, 7] {
+                let got = (ptr.add(fp32.Offset as usize + x * 4) as *const f32).read();
+                let want = 0.25 + 0.01 * x as f32;
+                assert!((got - want).abs() < 1e-6, "d32[{x}] = {got}, want {want}");
+            }
+            let s0 = (ptr.add(fp16[0].Offset as usize) as *const u16).read();
+            let s1 = (ptr.add(fp16[1].Offset as usize) as *const u16).read();
+            assert_eq!(s0, 16384);
+            assert_eq!(s1, 49151);
+            assert!(host.device.GetDeviceRemovedReason().is_ok());
+        }
     }
 }

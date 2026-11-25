@@ -1114,7 +1114,7 @@ fn default_view(resource: crate::object::This) -> bool {
 }
 
 /// Whether the host stores to typed unordered views of `format`.
-fn typed_store(format: u32) -> bool {
+pub(crate) fn typed_store(format: u32) -> bool {
     static KNOWN: Mutex<Vec<(u32, bool)>> = Mutex::new(Vec::new());
     let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(&(_, ok)) = known.iter().find(|(f, _)| *f == format) {
