@@ -584,7 +584,7 @@ pub fn stream<'a>(
         .get(&g.rasterizer_hash)
         .ok_or(Unnamed::Rasterizer)?;
     let blend = named.blend.get(&g.blend_hash).ok_or(Unnamed::Blend)?;
-    let (Some(formats), Some((depth_format, _, topology)), Some((_, count, quality)), Some(inputs)) = (
+    let (Some(formats), Some((depth_format, _, topology)), Some(samples), Some(inputs)) = (
         g.target_formats(),
         g.depth_targets_topology(),
         g.samples(),
@@ -592,6 +592,7 @@ pub fn stream<'a>(
     ) else {
         return Err(Unnamed::Metadata);
     };
+    let (sample_mask, count, quality) = samples;
     let mut s = vec![0u8; 0x2b0];
     let put = |s: &mut Vec<u8>, at: usize, v: u32| s[at..at + 4].copy_from_slice(&v.to_le_bytes());
     let put64 =
@@ -621,7 +622,7 @@ pub fn stream<'a>(
         put64(&mut s, 0x38, ps.len() as u64);
     }
     s[0x8c..0x1d4].copy_from_slice(&blend_desc(blend));
-    put(&mut s, 0x1dc, u32::MAX);
+    put(&mut s, 0x1dc, sample_mask);
     s[0x1e4..0x210].copy_from_slice(&rasterizer_desc(raster));
     s[0x214..0x24c].copy_from_slice(&depth_stencil_desc(depth));
     // The engine makes 1 to 16 samples, a power of two; 21 records store
@@ -741,13 +742,13 @@ mod tests {
     }
 
     /// A record's metadata: targets 28 and 10, depth format 40, topology
-    /// 3, two samples, and a layout of POSITION and COLOR.
-    fn metadata() -> Vec<u8> {
+    /// 3, and a layout of POSITION and COLOR.
+    fn metadata(sample_count: u8, sample_mask: u32) -> Vec<u8> {
         let mut m = vec![0; 0x4c];
         m[0x10..0x18].copy_from_slice(&[28, 0, 10, 0, 0, 0, 0, 0]);
-        m[0x1c..0x20].copy_from_slice(&u32::MAX.to_le_bytes());
+        m[0x1c..0x20].copy_from_slice(&sample_mask.to_le_bytes());
         m[0x24..0x27].copy_from_slice(&[40, 3, 3]);
-        m[0x28] = 2;
+        m[0x28] = sample_count;
         let mut layout = 2u32.to_le_bytes().to_vec();
         for (name, words) in [
             ("POSITION", [0u32, 6, 0, 0, 0, 0]),
@@ -764,7 +765,7 @@ mod tests {
 
     #[test]
     fn a_record_becomes_the_engines_creation_stream() {
-        let meta = metadata();
+        let meta = metadata(2, u32::MAX);
         let g = Graphics {
             key: 0,
             shader_hash: 0,
@@ -827,6 +828,17 @@ mod tests {
             .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
             .collect();
         assert_eq!(words, [1, 28, 1, 12, 1, 1]);
+
+        for mask in [0x5, 0, u32::MAX] {
+            let meta = metadata(4, mask);
+            let record = Graphics {
+                metadata: &meta,
+                ..g
+            };
+            let s = stream(&record, &named, &vs, false, Some(&ps)).unwrap();
+            assert_eq!(&s.bytes()[0x1dc..0x1e0], &mask.to_le_bytes());
+        }
+
         // A mesh shader goes in the first slot as type 24.
         let s = stream(&g, &named, &vs, true, None).unwrap();
         assert_eq!(
